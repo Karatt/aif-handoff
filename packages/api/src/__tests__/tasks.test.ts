@@ -1130,7 +1130,7 @@ describe("tasks API", () => {
       expect(existsSync(planFilePath)).toBe(true);
     });
 
-    it("should fire /aif-commit query when commitOnApprove=true", async () => {
+    it("should fire non-interactive commit query when commitOnApprove=true", async () => {
       const db = testDb.current;
       insertTestProject(db);
       db.insert(tasks)
@@ -1158,10 +1158,12 @@ describe("tasks API", () => {
       expect(mockRunApiRuntimeOneShot).toHaveBeenCalled();
       const callArgs =
         mockRunApiRuntimeOneShot.mock.calls[mockRunApiRuntimeOneShot.mock.calls.length - 1][0];
-      expect(callArgs.prompt).toBe("/aif-commit");
+      expect(callArgs.prompt).toContain("conventional commit");
+      expect(callArgs.prompt).toContain("git commit");
+      expect(callArgs.workflowKind).toBe("commit");
     });
 
-    it("should not fire /aif-commit query when commitOnApprove is not set", async () => {
+    it("should not fire commit query when commitOnApprove is not set", async () => {
       const db = testDb.current;
       insertTestProject(db);
       db.insert(tasks)
