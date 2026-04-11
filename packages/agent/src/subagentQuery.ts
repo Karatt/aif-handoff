@@ -43,7 +43,7 @@ const FIRST_ACTIVITY_TIMEOUT_ERROR = "first_activity_timeout";
 const FIRST_ACTIVITY_MAX_RETRIES = 2;
 
 /**
- * First-activity watchdog: aborts the agent if no tool call or subagent spawn
+ * First-activity watchdog: aborts the agent if no runtime activity
  * arrives within AGENT_FIRST_ACTIVITY_TIMEOUT_MS after "started".
  * Detects hung agents early (~60s) instead of waiting for the 90-min stale timeout.
  */
@@ -451,13 +451,27 @@ export async function executeSubagentQuery(
     const registry = await getRuntimeRegistry();
     adapter = registry.resolveRuntime(context.runtimeId);
 
-    // First-activity watchdog only works for SDK transport which streams tool events.
-    // CLI/API transports are opaque — no onToolUse callbacks until the run completes.
+    // First-activity watchdog requires a transport that surfaces incremental
+    // runtime activity in real time. SDK / CLI adapters emit RuntimeEvent
+    // callbacks for streamed text, reasoning, and tool summaries, so any such
+    // event proves the runtime is alive even if the workflow performs no tool
+    // calls. API transport is pure HTTP — no intermediate events — and must
+    // stay disabled.
+    //
+    // CLI gets a 2x buffer over SDK because it carries extra cold-start cost
+    // the SDK path doesn't have: binary spawn (~1-3s) and the initial
+    // system/init exchange with the full tool/MCP catalogue. Without the
+    // buffer, slow first-turn startup on CLI can false-positive the watchdog.
+    const baseFirstActivityTimeoutMs = getEnv().AGENT_FIRST_ACTIVITY_TIMEOUT_MS;
     const firstActivityTimeoutMs =
-      context.transport === "sdk" ? getEnv().AGENT_FIRST_ACTIVITY_TIMEOUT_MS : 0;
+      context.transport === "api"
+        ? 0
+        : context.transport === "cli"
+          ? baseFirstActivityTimeoutMs * 2
+          : baseFirstActivityTimeoutMs;
     let result: Awaited<ReturnType<RuntimeAdapter["run"]>> | undefined;
 
-    // Retry loop: if agent stalls (no tool activity after start), kill and restart
+    // Retry loop: if agent stalls (no runtime activity after start), kill and restart
     for (let attempt = 0; attempt <= FIRST_ACTIVITY_MAX_RETRIES; attempt++) {
       // Fresh AbortController per attempt — AbortController is single-use
       const attemptAbort = new AbortController();
@@ -482,8 +496,11 @@ export async function executeSubagentQuery(
       );
       // Override the abort controller with our per-attempt one
       executionIntent.abortController = attemptAbort;
-      // CLI/API transports produce output only after the full run — disable start timeout
-      if (context.transport !== "sdk") {
+      // API transport is pure HTTP — no incremental stream — so the
+      // start-timeout watchdog has nothing to observe and must stay off.
+      // SDK streams in-process and CLI now streams JSONL events (system/init
+      // arrives in the first few hundred ms), so both tolerate start timeout.
+      if (context.transport === "api") {
         executionIntent.startTimeoutMs = 0;
       }
 
@@ -493,7 +510,7 @@ export async function executeSubagentQuery(
         logActivity(
           taskId,
           "Agent",
-          `${agentName} stalled — no tool activity within ${timeoutSec}s after start (attempt ${attempt + 1}/${FIRST_ACTIVITY_MAX_RETRIES + 1}), restarting`,
+          `${agentName} stalled — no runtime activity within ${timeoutSec}s after start (attempt ${attempt + 1}/${FIRST_ACTIVITY_MAX_RETRIES + 1}), restarting`,
         );
         log.warn(
           { taskId, agentName, firstActivityTimeoutMs, attempt: attempt + 1 },
@@ -501,18 +518,24 @@ export async function executeSubagentQuery(
         );
       });
 
-      // Wrap callbacks to clear watchdog on first activity
+      // Install an onEvent bridge even when the caller did not request
+      // streamed events directly: the watchdog needs a callback to observe
+      // runtime activity for tool-less workflows such as checklist sync.
+      const wd = watchdog!;
+      const originalOnEvent = executionIntent.onEvent ?? (() => undefined);
       const originalOnToolUse = executionIntent.onToolUse;
       const originalOnSubagentStart = executionIntent.onSubagentStart;
+      executionIntent.onEvent = (event) => {
+        wd.markActivity();
+        originalOnEvent(event);
+      };
       if (originalOnToolUse) {
-        const wd = watchdog;
         executionIntent.onToolUse = (toolName, detail) => {
           wd.markActivity();
           originalOnToolUse(toolName, detail);
         };
       }
       if (originalOnSubagentStart) {
-        const wd = watchdog;
         executionIntent.onSubagentStart = (name, id) => {
           wd.markActivity();
           originalOnSubagentStart(name, id);
