@@ -47,6 +47,26 @@ Checks whether agent authentication is configured via `ANTHROPIC_API_KEY` and/or
 
 `authSource` values: `api_key`, `claude_profile`, `both`, `none`.
 
+### Runtime Settings
+
+```
+GET /settings
+```
+
+Returns frontend-visible defaults and runtime readiness metadata.
+
+**Response:** `200 OK`
+
+```json
+{
+  "useSubagents": true,
+  "maxReviewIterations": 3,
+  "autoReviewStrategy": "full_re_review"
+}
+```
+
+`autoReviewStrategy` is the resolved global auto-review mode (`full_re_review` or `closure_first`).
+
 ## Projects
 
 ### List Projects
@@ -174,6 +194,39 @@ DELETE /projects/:id
 { "success": true }
 ```
 
+### Get Auto-Queue Mode
+
+```
+GET /projects/:id/auto-queue-mode
+```
+
+Returns the current auto-queue state for the project. When enabled, the
+coordinator advances the next backlog task (by `position`) into planning
+whenever the project has no active/locked task.
+
+**Response:** `200 OK`
+
+```json
+{ "enabled": true }
+```
+
+### Toggle Auto-Queue Mode
+
+```
+PATCH /projects/:id/auto-queue-mode
+```
+
+**Body:** `{ "enabled": boolean }`
+
+Broadcasts `project:auto_queue_mode_changed` over WebSocket so connected
+clients can update their board indicator.
+
+**Response:** `200 OK`
+
+```json
+{ "enabled": true }
+```
+
 ### Get Project MCP Config
 
 ```
@@ -238,6 +291,7 @@ POST /tasks
 | `useSubagents` | boolean | no | `true` | Run via custom subagents (`plan-coordinator`, `implement-coordinator`, sidecars). `false` uses `aif-*` skills directly |
 | `roadmapAlias` | string | no | `null` | Roadmap alias for grouping (e.g., `v1.0`) |
 | `tags` | string[] | no | `[]` | Tags for filtering/categorization (max 50, each max 100 chars) |
+| `scheduledAt` | string \| null | no | `null` | ISO-8601 UTC timestamp. If set, the coordinator fires the task into planning at that time. Must be in the future; `null` clears it. Accepted on both create and update. |
 
 **Attachment object:**
 | Field | Type | Description |
@@ -258,6 +312,13 @@ GET /tasks/:id
 ```
 
 **Response:** `200 OK` — full task object.
+
+Notable task fields in the response:
+
+| Field                  | Type         | Description                                                                                                      |
+| ---------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `manualReviewRequired` | boolean      | `true` when auto-review stopped and explicit human review is required while the task remains in `done`           |
+| `autoReviewState`      | object\|null | Latest persisted blocking-findings snapshot used by the auto-review loop (`strategy`, `iteration`, `findings[]`) |
 
 ### Download Task Attachment
 
@@ -306,6 +367,7 @@ PUT /tasks/:id
 | `plan` | string\|null | Generated plan (markdown) |
 | `implementationLog` | string\|null | Implementation output |
 | `reviewComments` | string\|null | Review feedback |
+| `manualReviewRequired` | boolean | Explicit human-review handoff flag for `done` tasks |
 | `agentActivityLog` | string\|null | Agent activity timeline |
 | `blockedReason` | string\|null | Why the task is blocked |
 | `blockedFromStatus` | string\|null | Status before being blocked |
@@ -361,7 +423,8 @@ Additional constraints:
 - `accept_existing_plan` reads the plan file from disk, saves it to the database, and transitions directly to `plan_ready` — skipping the planning stage entirely. Returns `404` if the plan file does not exist on disk.
 - `fast_fix` requires `autoMode=false` and at least one human comment on the task.
 - `request_changes` transitions `done -> implementing`, sets `reworkRequested=true`, and resets watchdog retry state (`retryCount=0`).
-- With `autoMode=true`, coordinator can trigger this same `request_changes`-style rework loop automatically after review if fix items are extracted from `reviewComments`.
+- With `autoMode=true`, coordinator can trigger this same `request_changes`-style rework loop automatically after review if blocking findings are extracted from `reviewComments`.
+- If auto-review stops converging, the coordinator leaves the task in `done`, sets `manualReviewRequired=true`, and waits for a human `approve_done` or `request_changes` action.
 
 **Response:** `200 OK` — the updated task object.
 
@@ -565,20 +628,23 @@ All events are JSON with this structure:
 }
 ```
 
-| Event                 | Payload                             | Triggered By                                                                         |
-| --------------------- | ----------------------------------- | ------------------------------------------------------------------------------------ |
-| `project:created`     | Full project object                 | `POST /projects`                                                                     |
-| `task:created`        | Full task object                    | `POST /tasks`, `POST /projects/:id/roadmap/import`                                   |
-| `task:updated`        | Full task object                    | `PUT /tasks/:id`, `PATCH /tasks/:id/position`, `POST /tasks/:id/events` (`fast_fix`) |
-| `task:moved`          | Full task object                    | `POST /tasks/:id/events`                                                             |
-| `task:deleted`        | `{ id: string }`                    | `DELETE /tasks/:id`                                                                  |
-| `sync:task_created`   | Full task object                    | MCP `handoff_create_task`                                                            |
-| `sync:task_updated`   | Full task object                    | MCP `handoff_update_task`, `handoff_push_plan`                                       |
-| `sync:status_changed` | Full task object                    | MCP `handoff_sync_status`                                                            |
-| `sync:plan_pushed`    | Full task object                    | MCP `handoff_push_plan`                                                              |
-| `chat:token`          | `{ conversationId, token }`         | `POST /chat` — streaming response tokens                                             |
-| `chat:done`           | `{ conversationId }`                | `POST /chat` — stream completed                                                      |
-| `chat:error`          | `{ conversationId, message, code }` | `POST /chat` — error during streaming                                                |
+| Event                             | Payload                             | Triggered By                                                                         |
+| --------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------ |
+| `project:created`                 | Full project object                 | `POST /projects`                                                                     |
+| `task:created`                    | Full task object                    | `POST /tasks`, `POST /projects/:id/roadmap/import`                                   |
+| `task:updated`                    | Full task object                    | `PUT /tasks/:id`, `PATCH /tasks/:id/position`, `POST /tasks/:id/events` (`fast_fix`) |
+| `task:moved`                      | Full task object                    | `POST /tasks/:id/events`                                                             |
+| `task:deleted`                    | `{ id: string }`                    | `DELETE /tasks/:id`                                                                  |
+| `sync:task_created`               | Full task object                    | MCP `handoff_create_task`                                                            |
+| `sync:task_updated`               | Full task object                    | MCP `handoff_update_task`, `handoff_push_plan`                                       |
+| `sync:status_changed`             | Full task object                    | MCP `handoff_sync_status`                                                            |
+| `sync:plan_pushed`                | Full task object                    | MCP `handoff_push_plan`                                                              |
+| `chat:token`                      | `{ conversationId, token }`         | `POST /chat` — streaming response tokens                                             |
+| `chat:done`                       | `{ conversationId }`                | `POST /chat` — stream completed                                                      |
+| `chat:error`                      | `{ conversationId, message, code }` | `POST /chat` — error during streaming                                                |
+| `task:scheduled_fired`            | Full task object                    | Coordinator fires a backlog task whose `scheduledAt` is due                          |
+| `project:auto_queue_mode_changed` | Full project object                 | `PATCH /projects/:id/auto-queue-mode`                                                |
+| `project:auto_queue_advanced`     | `{ id: string }` (task id)          | Coordinator auto-advances the next backlog task in an auto-queue project             |
 
 ### Connection
 
@@ -588,7 +654,7 @@ The WebSocket endpoint is a simple broadcast channel — no authentication, no s
 
 The Handoff MCP server (`packages/mcp`) provides bidirectional sync between AIF tooling and Handoff via the Model Context Protocol. When MCP tools modify tasks, they broadcast `sync:*` events over the WebSocket system so the Kanban UI reflects changes in real time.
 
-The web settings route `POST /settings/mcp/install` installs the MCP server into supported runtimes. When `MCP_PORT` is set in the server environment, it writes a streamable HTTP entry pointing to `http://localhost:<MCP_PORT>/mcp`; otherwise it writes the local `stdio` launcher entry.
+The web settings route `POST /settings/mcp/install` installs the MCP server into supported runtimes. When `MCP_PORT` is a valid integer port in the server environment, it writes a streamable HTTP entry pointing to `http://localhost:<MCP_PORT>/mcp`; otherwise it writes the local `stdio` launcher entry. The response includes per-runtime success/error entries, so partial install failures are surfaced without hiding runtimes that succeeded.
 
 See [MCP Sync Server](mcp-sync.md) for full documentation.
 

@@ -3,6 +3,12 @@
 export {
   TASK_STATUSES,
   type TaskStatus,
+  AUTO_REVIEW_STRATEGIES,
+  type AutoReviewStrategy,
+  AUTO_REVIEW_FINDING_SOURCES,
+  type AutoReviewFindingSource,
+  type AutoReviewFinding,
+  type AutoReviewState,
   type Project,
   type CreateProjectInput,
   type Task,
@@ -19,6 +25,7 @@ export {
   type WsEvent,
   type RoadmapCompletePayload,
   type RoadmapErrorPayload,
+  type TaskCommitPayload,
   type ChatMessage,
   type ChatMessageAttachment,
   type ChatAttachment,
@@ -54,3 +61,7 @@ export type { GeneratePlanPathOptions } from "./planPath.js";
 
 // Sync types (browser-safe subset — types only, no Node.js logger dependency)
 export type { SyncDirection, ConflictResolution, SyncEvent, PlanAnnotation } from "./sync.js";
+
+// Planner mode defaults (pure, browser-safe)
+export { defaultsForMode } from "./plannerDefaults.js";
+export type { PlannerMode, PlannerFlagDefaults } from "./plannerDefaults.js";

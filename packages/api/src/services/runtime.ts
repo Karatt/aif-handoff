@@ -14,10 +14,12 @@ import {
   type RuntimeAdapter,
   type RuntimeModelDiscoveryService,
   type RuntimeRegistry,
+  type RuntimeUsageContext,
   type RuntimeWorkflowSpec,
 } from "@aif/runtime";
 import { getEnv, logger } from "@aif/shared";
 import {
+  createDbUsageSink,
   findProjectById,
   findRuntimeProfileById,
   findTaskById,
@@ -41,8 +43,15 @@ export async function getApiRuntimeRegistry(): Promise<RuntimeRegistry> {
         warn(context, message) {
           log.warn({ ...context }, `WARN [runtime-module] ${message}`);
         },
+        error(context, message) {
+          log.error({ ...context }, `ERROR [runtime-registry] ${message}`);
+        },
       },
       runtimeModules: getEnv().AIF_RUNTIME_MODULES ?? [],
+      // DB-backed sink persists every successful run through the registry
+      // wrapper. Structurally matches @aif/runtime's RuntimeUsageSink —
+      // no cross-package type import needed.
+      usageSink: createDbUsageSink(),
     }).catch((error) => {
       runtimeRegistryPromise = null;
       throw error;
@@ -237,6 +246,20 @@ export async function runApiRuntimeOneShot(input: {
   systemPromptAppend?: string;
   includePartialMessages?: boolean;
   maxTurns?: number;
+  /**
+   * Hint for adapters that support slash-command / skill resolution (e.g.
+   * Claude Code CLI). Passed through to the workflow spec so compatible
+   * adapters can invoke the named skill instead of relying on the prompt
+   * text alone. Adapters that do not support it ignore this field.
+   */
+  fallbackSlashCommand?: string;
+  /**
+   * Scope metadata for usage tracking. Callers must pick one `UsageSource`
+   * value identifying the logical flow (fast-fix, commit, roadmap-*, ...).
+   * `projectId` is always included automatically; `taskId` is added when the
+   * caller passes one in `input.taskId`.
+   */
+  usageContext: RuntimeUsageContext;
 }): Promise<{
   result: RuntimeRunResult;
   context: RuntimeExecutionContext;
@@ -248,6 +271,7 @@ export async function runApiRuntimeOneShot(input: {
     requiredCapabilities: input.requiredCapabilities ?? [],
     sessionReusePolicy: "never",
     systemPromptAppend: input.systemPromptAppend,
+    fallbackSlashCommand: input.fallbackSlashCommand,
   });
 
   const context = await resolveApiRuntimeContext({
@@ -276,6 +300,14 @@ export async function runApiRuntimeOneShot(input: {
     projectRoot: input.projectRoot,
     cwd: input.projectRoot,
     headers: context.resolvedProfile.headers,
+    // Merge caller's usageContext with scope fields we already know here.
+    // The caller chooses the source (commit, fast-fix, ...); we fill in
+    // projectId + taskId so the sink has the full scope automatically.
+    usageContext: {
+      ...input.usageContext,
+      projectId: input.projectId,
+      taskId: input.taskId ?? null,
+    },
     options: {
       ...context.resolvedProfile.options,
       ...(context.resolvedProfile.baseUrl ? { baseUrl: context.resolvedProfile.baseUrl } : {}),

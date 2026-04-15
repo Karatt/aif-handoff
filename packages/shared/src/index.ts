@@ -6,6 +6,7 @@ export {
   runtimeProfiles,
   chatSessions,
   chatMessages,
+  usageEvents,
 } from "./schema.js";
 export type {
   ProjectRow,
@@ -20,12 +21,20 @@ export type {
   NewChatSessionRow,
   ChatMessageRow,
   NewChatMessageRow,
+  UsageEventRow,
+  NewUsageEventRow,
 } from "./schema.js";
 
 // Types
 export {
   TASK_STATUSES,
   type TaskStatus,
+  AUTO_REVIEW_STRATEGIES,
+  type AutoReviewStrategy,
+  AUTO_REVIEW_FINDING_SOURCES,
+  type AutoReviewFindingSource,
+  type AutoReviewFinding,
+  type AutoReviewState,
   type Project,
   type CreateProjectInput,
   type Task,
@@ -124,6 +133,7 @@ export {
   type AifProjectConfig,
   type AifProjectPaths,
   type AifProjectWorkflow,
+  type AifProjectGit,
 } from "./projectConfig.js";
 
 // Telegram notifications
@@ -133,5 +143,10 @@ export {
   type TelegramNotificationOptions,
 } from "./telegram.js";
 
+// Planner mode defaults
+export { defaultsForMode } from "./plannerDefaults.js";
+export type { PlannerMode, PlannerFlagDefaults } from "./plannerDefaults.js";
+
 // Utilities
 export { withTimeout } from "./withTimeout.js";
+export { parseMcpPortSetting, type ParsedMcpPortSetting } from "./mcpPort.js";

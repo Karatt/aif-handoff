@@ -11,6 +11,30 @@ export const TASK_STATUSES = [
 
 export type TaskStatus = (typeof TASK_STATUSES)[number];
 
+export const AUTO_REVIEW_STRATEGIES = ["full_re_review", "closure_first"] as const;
+
+export type AutoReviewStrategy = (typeof AUTO_REVIEW_STRATEGIES)[number];
+
+export const AUTO_REVIEW_FINDING_SOURCES = [
+  "code_review",
+  "security_audit",
+  "review_gate",
+] as const;
+
+export type AutoReviewFindingSource = (typeof AUTO_REVIEW_FINDING_SOURCES)[number];
+
+export interface AutoReviewFinding {
+  id: string;
+  text: string;
+  source: AutoReviewFindingSource;
+}
+
+export interface AutoReviewState {
+  strategy: AutoReviewStrategy;
+  iteration: number;
+  findings: AutoReviewFinding[];
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -20,10 +44,16 @@ export interface Project {
   implementerMaxBudgetUsd: number | null;
   reviewSidecarMaxBudgetUsd: number | null;
   parallelEnabled: boolean;
+  autoQueueMode: boolean;
   defaultTaskRuntimeProfileId?: string | null;
   defaultPlanRuntimeProfileId?: string | null;
   defaultReviewRuntimeProfileId?: string | null;
   defaultChatRuntimeProfileId?: string | null;
+  /** Aggregate token/cost usage across ALL sources (tasks, chat, commit, roadmap). */
+  tokenInput?: number;
+  tokenOutput?: number;
+  tokenTotal?: number;
+  costUsd?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -36,6 +66,7 @@ export interface CreateProjectInput {
   implementerMaxBudgetUsd?: number;
   reviewSidecarMaxBudgetUsd?: number;
   parallelEnabled?: boolean;
+  autoQueueMode?: boolean;
   defaultTaskRuntimeProfileId?: string | null;
   defaultPlanRuntimeProfileId?: string | null;
   defaultReviewRuntimeProfileId?: string | null;
@@ -86,6 +117,8 @@ export interface Task {
   reworkRequested: boolean;
   reviewIterationCount: number;
   maxReviewIterations: number;
+  manualReviewRequired: boolean;
+  autoReviewState: AutoReviewState | null;
   paused: boolean;
   lastHeartbeatAt: string | null;
   lastSyncedAt: string | null;
@@ -93,6 +126,7 @@ export interface Task {
   modelOverride?: string | null;
   runtimeOptions?: Record<string, unknown> | null;
   sessionId: string | null;
+  scheduledAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -133,6 +167,7 @@ export interface CreateTaskInput {
   runtimeOptions?: Record<string, unknown> | null;
   roadmapAlias?: string;
   tags?: string[];
+  scheduledAt?: string | null;
 }
 
 /** PUT /tasks/:id body */
@@ -166,11 +201,14 @@ export interface UpdateTaskInput {
   reworkRequested?: boolean;
   reviewIterationCount?: number;
   maxReviewIterations?: number;
+  manualReviewRequired?: boolean;
+  autoReviewState?: AutoReviewState | null;
   paused?: boolean;
   lastHeartbeatAt?: string | null;
   runtimeProfileId?: string | null;
   modelOverride?: string | null;
   runtimeOptions?: Record<string, unknown> | null;
+  scheduledAt?: string | null;
 }
 
 export const TASK_EVENTS = [
@@ -217,7 +255,13 @@ export type WsEventType =
   | "sync:task_updated"
   | "sync:status_changed"
   | "sync:plan_pushed"
-  | "task:activity";
+  | "task:activity"
+  | "task:scheduled_fired"
+  | "project:auto_queue_mode_changed"
+  | "project:auto_queue_advanced"
+  | "task:commit_started"
+  | "task:commit_done"
+  | "task:commit_failed";
 
 export interface RoadmapCompletePayload {
   projectId: string;
@@ -235,6 +279,18 @@ export interface RoadmapErrorPayload {
   code: string;
 }
 
+/**
+ * Emitted when the "create commit" checkbox is used on approve-done, to
+ * surface the lifecycle of the fire-and-forget `/aif-commit` run to the UI.
+ * `status` is redundant with `type` but makes the payload self-describing.
+ */
+export interface TaskCommitPayload {
+  taskId: string;
+  projectId: string;
+  status: "started" | "done" | "failed";
+  error?: string;
+}
+
 export interface WsEvent {
   type: WsEventType;
   payload:
@@ -246,7 +302,8 @@ export interface WsEvent {
     | ChatStreamTokenPayload
     | ChatDonePayload
     | ChatErrorPayload
-    | ChatSession;
+    | ChatSession
+    | TaskCommitPayload;
 }
 
 export const RuntimeTransport = {
@@ -430,8 +487,22 @@ export interface ChatStreamTokenPayload {
   token: string;
 }
 
+/**
+ * Per-turn token usage reported to the frontend alongside the `chat:done`
+ * event. Matches `RuntimeUsage` from `@aif/runtime` structurally, duplicated
+ * here to avoid forcing `@aif/shared` to depend on the runtime layer.
+ */
+export interface ChatDoneUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUsd?: number;
+}
+
 export interface ChatDonePayload {
   conversationId: string;
+  /** Null when the adapter/transport does not report usage for this turn. */
+  usage?: ChatDoneUsage | null;
 }
 
 export interface ChatErrorPayload {

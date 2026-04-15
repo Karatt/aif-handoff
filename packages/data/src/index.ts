@@ -1,5 +1,7 @@
 import { and, asc, count, desc, eq, gt, inArray, isNotNull, isNull, like, lte, min, or, sql } from "drizzle-orm";
 import {
+  AUTO_REVIEW_FINDING_SOURCES,
+  AUTO_REVIEW_STRATEGIES,
   generatePlanPath,
   getProjectConfig,
   logger as createLogger,
@@ -12,12 +14,14 @@ import {
   runtimeProfiles,
   chatSessions,
   chatMessages,
+  usageEvents,
   type CreateRuntimeProfileInput,
   type EffectiveRuntimeProfileSelection,
   type RuntimeProfile,
   type UpdateRuntimeProfileInput,
   type Task,
   type TaskStatus,
+  type AutoReviewState,
   type ChatSession,
   type ChatSessionMessage,
   type ChatSessionRow,
@@ -27,16 +31,21 @@ import {
 import { getDb } from "@aif/shared/server";
 
 const log = createLogger("data");
+const AUTO_REVIEW_STRATEGY_SET = new Set<string>(AUTO_REVIEW_STRATEGIES);
+const AUTO_REVIEW_FINDING_SOURCE_SET = new Set<string>(AUTO_REVIEW_FINDING_SOURCES);
 
 export type TaskRow = typeof tasks.$inferSelect;
 export type CommentRow = typeof taskComments.$inferSelect;
 export type ProjectRow = typeof projects.$inferSelect;
 export type RuntimeProfileRow = typeof runtimeProfiles.$inferSelect;
+export type HydratedTaskRow = TaskRow & { autoReviewState?: AutoReviewState | null };
 
 export type CoordinatorStage = "planner" | "plan-checker" | "implementer" | "reviewer";
 
 /** DB-level patch: all mutable task columns with their storage types (attachments/tags as JSON strings). */
-export type TaskFieldsPatch = Partial<Omit<TaskRow, "id" | "projectId" | "createdAt">>;
+export type TaskFieldsPatch = Partial<Omit<TaskRow, "id" | "projectId" | "createdAt">> & {
+  autoReviewState?: AutoReviewState | null;
+};
 
 /** API-level update: domain types (attachments as array, tags as string[]). Serialization handled by data layer. */
 export type TaskFieldsUpdate = {
@@ -68,21 +77,25 @@ export type TaskFieldsUpdate = {
   reworkRequested?: boolean;
   reviewIterationCount?: number;
   maxReviewIterations?: number;
+  manualReviewRequired?: boolean;
+  autoReviewState?: AutoReviewState | null;
   paused?: boolean;
   lastHeartbeatAt?: string | null;
   runtimeProfileId?: string | null;
   modelOverride?: string | null;
   runtimeOptions?: Record<string, unknown> | null;
   position?: number;
+  scheduledAt?: string | null;
 };
 
 
 export function toTaskResponse(task: TaskRow): Task {
-  const { attachments, tags, runtimeOptionsJson, ...rest } = task;
+  const { attachments, tags, runtimeOptionsJson, autoReviewStateJson, ...rest } = task;
   return {
     ...rest,
     attachments: parseAttachments(attachments),
     tags: parseTags(tags),
+    autoReviewState: parseAutoReviewState(autoReviewStateJson),
     runtimeOptions: parseRuntimeObject(runtimeOptionsJson),
   };
 }
@@ -105,6 +118,95 @@ function parseRuntimeObject(raw: string | null | undefined): Record<string, unkn
       ? (parsed as Record<string, unknown>)
       : null;
   } catch {
+    return null;
+  }
+}
+
+function parseAutoReviewState(raw: string | null | undefined): AutoReviewState | null {
+  if (!raw) return null;
+
+  const preview = raw.length > 200 ? `${raw.slice(0, 200)}...` : raw;
+  const warnMalformed = (reason: string, extra: Record<string, unknown> = {}) => {
+    log.warn({ reason, raw: preview, ...extra }, "Malformed persisted auto-review payload");
+  };
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      warnMalformed("root_not_object");
+      return null;
+    }
+
+    const candidate = parsed as Record<string, unknown>;
+
+    const strategy =
+      typeof candidate.strategy === "string" &&
+      AUTO_REVIEW_STRATEGY_SET.has(candidate.strategy)
+        ? candidate.strategy
+        : null;
+    const iteration =
+      typeof candidate.iteration === "number" &&
+      Number.isFinite(candidate.iteration) &&
+      Number.isInteger(candidate.iteration) &&
+      candidate.iteration >= 0
+        ? candidate.iteration
+        : null;
+    const findings = Array.isArray(candidate.findings) ? candidate.findings : null;
+
+    if (!strategy || iteration == null || !findings) {
+      warnMalformed("missing_required_fields", {
+        hasStrategy: Boolean(strategy),
+        hasIteration: iteration != null,
+        hasFindings: Boolean(findings),
+      });
+      return null;
+    }
+
+    const normalizedFindings: AutoReviewState["findings"] = [];
+    for (const item of findings) {
+      if (!item || typeof item !== "object") {
+        warnMalformed("invalid_finding_shape");
+        return null;
+      }
+
+      const finding = item as Record<string, unknown>;
+      if (
+        typeof finding.id !== "string" ||
+        typeof finding.text !== "string" ||
+        typeof finding.source !== "string" ||
+        !AUTO_REVIEW_FINDING_SOURCE_SET.has(finding.source)
+      ) {
+        warnMalformed("invalid_finding_fields", {
+          findingId: finding.id,
+          findingSource: finding.source,
+        });
+        return null;
+      }
+
+      normalizedFindings.push({
+        id: finding.id,
+        text: finding.text,
+        source: finding.source as AutoReviewState["findings"][number]["source"],
+      });
+    }
+
+    if (normalizedFindings.length !== findings.length) {
+      warnMalformed("dropped_invalid_findings", {
+        expectedCount: findings.length,
+        actualCount: normalizedFindings.length,
+      });
+      return null;
+    }
+
+    return {
+      strategy: strategy as AutoReviewState["strategy"],
+      iteration,
+      findings: normalizedFindings,
+    };
+  } catch (error) {
+    warnMalformed("json_parse_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
     return null;
   }
 }
@@ -141,8 +243,13 @@ export function toCommentResponse(comment: CommentRow) {
   };
 }
 
-export function findTaskById(id: string): TaskRow | undefined {
-  return getDb().select().from(tasks).where(eq(tasks.id, id)).get();
+export function findTaskById(id: string): HydratedTaskRow | undefined {
+  const row = getDb().select().from(tasks).where(eq(tasks.id, id)).get();
+  if (!row) return undefined;
+  return {
+    ...row,
+    autoReviewState: parseAutoReviewState(row.autoReviewStateJson),
+  };
 }
 
 export function listTasks(projectId?: string): TaskRow[] {
@@ -164,7 +271,7 @@ export type TaskSummaryRow = Pick<TaskRow,
   | "autoMode" | "isFix" | "paused" | "roadmapAlias" | "tags"
   | "runtimeProfileId" | "modelOverride"
   | "blockedReason" | "blockedFromStatus" | "retryCount"
-  | "reworkRequested" | "reviewIterationCount" | "maxReviewIterations"
+  | "reworkRequested" | "reviewIterationCount" | "maxReviewIterations" | "manualReviewRequired"
   | "tokenTotal" | "costUsd" | "lastSyncedAt" | "createdAt" | "updatedAt"
 >;
 
@@ -188,6 +295,7 @@ const SUMMARY_COLUMNS = {
   reworkRequested: tasks.reworkRequested,
   reviewIterationCount: tasks.reviewIterationCount,
   maxReviewIterations: tasks.maxReviewIterations,
+  manualReviewRequired: tasks.manualReviewRequired,
   tokenTotal: tasks.tokenTotal,
   costUsd: tasks.costUsd,
   lastSyncedAt: tasks.lastSyncedAt,
@@ -309,6 +417,7 @@ export function createTask(input: {
   runtimeOptions?: Record<string, unknown> | null;
   roadmapAlias?: string;
   tags?: string[];
+  scheduledAt?: string | null;
 }): TaskRow | undefined {
   const db = getDb();
   const id = crypto.randomUUID();
@@ -355,7 +464,9 @@ export function createTask(input: {
         input.runtimeOptions === undefined ? null : JSON.stringify(input.runtimeOptions),
       roadmapAlias: input.roadmapAlias ?? null,
       tags: JSON.stringify(input.tags ?? []),
+      scheduledAt: input.scheduledAt ?? null,
       reworkRequested: false,
+      manualReviewRequired: false,
       status: "backlog",
       position: (() => {
         const row = db
@@ -375,7 +486,7 @@ export function createTask(input: {
 }
 
 export function updateTask(id: string, fields: TaskFieldsUpdate): TaskRow | undefined {
-  const { attachments, tags, runtimeOptions, ...rest } = fields;
+  const { attachments, tags, runtimeOptions, autoReviewState, ...rest } = fields;
   const patch: TaskFieldsPatch = { ...rest, updatedAt: new Date().toISOString() };
   if (attachments !== undefined) {
     patch.attachments = JSON.stringify(attachments);
@@ -385,6 +496,10 @@ export function updateTask(id: string, fields: TaskFieldsUpdate): TaskRow | unde
   }
   if (runtimeOptions !== undefined) {
     patch.runtimeOptionsJson = runtimeOptions === null ? null : JSON.stringify(runtimeOptions);
+  }
+  if (autoReviewState !== undefined) {
+    patch.autoReviewStateJson =
+      autoReviewState === null ? null : JSON.stringify(autoReviewState);
   }
   if (fields.runtimeProfileId !== undefined || fields.modelOverride !== undefined) {
     log.debug(
@@ -400,8 +515,22 @@ export function updateTask(id: string, fields: TaskFieldsUpdate): TaskRow | unde
   return findTaskById(id);
 }
 
+/**
+ * Write only the `position` column. Does NOT bump `updatedAt` — manual reorder
+ * is metadata, not content, and must not disturb "updated at" sort views.
+ */
+export function updateTaskPositionOnly(id: string, position: number): void {
+  getDb().update(tasks).set({ position }).where(eq(tasks.id, id)).run();
+}
+
 export function setTaskFields(id: string, fields: TaskFieldsPatch): void {
-  getDb().update(tasks).set(fields).where(eq(tasks.id, id)).run();
+  const { autoReviewState, ...rest } = fields;
+  const patch: Partial<TaskRow> & { autoReviewStateJson?: string | null } = { ...rest };
+  if (autoReviewState !== undefined) {
+    patch.autoReviewStateJson =
+      autoReviewState === null ? null : JSON.stringify(autoReviewState);
+  }
+  getDb().update(tasks).set(patch).where(eq(tasks.id, id)).run();
 }
 
 export function deleteTask(id: string): void {
@@ -648,6 +777,61 @@ export function claimTask(taskId: string, coordinatorId: string, lockDurationMs:
 }
 
 /** Check if any task in a project is currently locked (active, non-expired). */
+/**
+ * Conditional advance from `backlog` to `planning`. Returns `true` only if
+ * the row was actually updated — i.e. the task was still in `backlog` and
+ * not paused at the moment of the write. This is the CAS that prevents two
+ * coordinator passes (auto-queue + scheduler, or two replicas) from racing
+ * the same task through the transition twice. Callers that observe `false`
+ * must skip the task without further side effects (no broadcast, no log
+ * entry).
+ *
+ * Clears `scheduledAt` in the same write so the scheduler can't re-fire a
+ * task that auto-queue already advanced (or vice versa).
+ */
+export function claimBacklogTaskForAdvance(taskId: string): boolean {
+  const nowIso = new Date().toISOString();
+  const result = getDb()
+    .update(tasks)
+    .set({
+      status: "planning",
+      scheduledAt: null,
+      blockedReason: null,
+      blockedFromStatus: null,
+      retryAfter: null,
+      retryCount: 0,
+      reworkRequested: false,
+      reviewIterationCount: 0,
+      manualReviewRequired: false,
+      autoReviewStateJson: null,
+      lastHeartbeatAt: nowIso,
+      updatedAt: nowIso,
+    })
+    .where(and(eq(tasks.id, taskId), eq(tasks.status, "backlog"), eq(tasks.paused, false)))
+    .run();
+  return result.changes > 0;
+}
+
+/**
+ * Count tasks the auto-queue must consider "still in flight" before advancing
+ * the next backlog item. Includes blocked_external so retry-cycles don't
+ * cause the pool to overshoot. Excludes terminal (done/verified) and the
+ * source state (backlog).
+ */
+export function countActivePipelineTasksForProject(projectId: string): number {
+  const row = getDb()
+    .select({ cnt: count() })
+    .from(tasks)
+    .where(
+      and(
+        eq(tasks.projectId, projectId),
+        inArray(tasks.status, ["planning", "plan_ready", "implementing", "review", "blocked_external"]),
+      ),
+    )
+    .get();
+  return row?.cnt ?? 0;
+}
+
 export function hasActiveLockedTaskForProject(projectId: string): boolean {
   const nowIso = new Date().toISOString();
   const row = getDb()
@@ -725,6 +909,99 @@ export function listDueBlockedExternalTasks(nowIso: string): TaskRow[] {
       ),
     )
     .all();
+}
+
+/** Backlog tasks whose `scheduledAt` is due (<= nowIso). Skips paused tasks. */
+export function listDueScheduledTasks(nowIso: string): TaskRow[] {
+  log.debug({ nowIso }, "Scanning for due scheduled tasks");
+  const rows = getDb()
+    .select()
+    .from(tasks)
+    .where(
+      and(
+        eq(tasks.status, "backlog"),
+        eq(tasks.paused, false),
+        isNotNull(tasks.scheduledAt),
+        lte(tasks.scheduledAt, nowIso),
+      ),
+    )
+    .all();
+  log.debug({ dueCount: rows.length }, "Due scheduled tasks resolved");
+  return rows;
+}
+
+/** Clear scheduledAt after firing; bumps updatedAt. */
+export function clearScheduledAt(taskId: string): void {
+  log.debug({ taskId }, "Clearing scheduledAt");
+  const nowIso = new Date().toISOString();
+  getDb()
+    .update(tasks)
+    .set({ scheduledAt: null, updatedAt: nowIso })
+    .where(eq(tasks.id, taskId))
+    .run();
+}
+
+/** Set or clear scheduledAt. Caller validates the ISO string upstream. */
+export function updateScheduledAt(taskId: string, scheduledAt: string | null): void {
+  log.debug({ taskId, scheduledAt }, "Updating scheduledAt");
+  const nowIso = new Date().toISOString();
+  getDb()
+    .update(tasks)
+    .set({ scheduledAt, updatedAt: nowIso })
+    .where(eq(tasks.id, taskId))
+    .run();
+}
+
+/** Read the auto-queue flag for a project. Returns false for unknown projects. */
+export function getAutoQueueMode(projectId: string): boolean {
+  const row = getDb()
+    .select({ autoQueueMode: projects.autoQueueMode })
+    .from(projects)
+    .where(eq(projects.id, projectId))
+    .get();
+  return Boolean(row?.autoQueueMode);
+}
+
+/** Projects with `autoQueueMode = true`. Used by the coordinator's auto-advance pass. */
+export function listAutoQueueProjects(): ProjectRow[] {
+  return getDb().select().from(projects).where(eq(projects.autoQueueMode, true)).all();
+}
+
+/** Toggle the project-level auto-queue flag. */
+export function setAutoQueueMode(projectId: string, enabled: boolean): void {
+  log.info({ projectId, enabled }, "Setting auto-queue mode");
+  const nowIso = new Date().toISOString();
+  getDb()
+    .update(projects)
+    .set({ autoQueueMode: enabled, updatedAt: nowIso })
+    .where(eq(projects.id, projectId))
+    .run();
+}
+
+/**
+ * Next backlog task in a project ordered by `position` ascending.
+ * Skips paused tasks and tasks that still have a future `scheduledAt`
+ * (those belong to the scheduled-task trigger, not the auto-queue advancer).
+ */
+export function nextBacklogTaskByPosition(projectId: string): TaskRow | undefined {
+  const nowIso = new Date().toISOString();
+  return getDb()
+    .select()
+    .from(tasks)
+    .where(
+      and(
+        eq(tasks.projectId, projectId),
+        eq(tasks.status, "backlog"),
+        eq(tasks.paused, false),
+        or(
+          isNull(tasks.scheduledAt),
+          lte(tasks.scheduledAt, nowIso),
+        ),
+      ),
+    )
+    .orderBy(asc(tasks.position))
+    .limit(1)
+    .get();
 }
 
 export function listStaleInProgressTasks(): TaskRow[] {
@@ -807,6 +1084,193 @@ export function incrementTaskTokenUsage(
     .run();
 
   return delta;
+}
+
+export function incrementProjectTokenUsage(
+  projectId: string,
+  usage: Record<string, unknown> | null | undefined,
+) {
+  const delta = parseTaskTokenUsage(usage);
+  if (delta.total === 0 && delta.costUsd === 0) return delta;
+
+  getDb()
+    .update(projects)
+    .set({
+      tokenInput: sql<number>`coalesce(${projects.tokenInput}, 0) + ${delta.input}`,
+      tokenOutput: sql<number>`coalesce(${projects.tokenOutput}, 0) + ${delta.output}`,
+      tokenTotal: sql<number>`coalesce(${projects.tokenTotal}, 0) + ${delta.total}`,
+      costUsd: sql<number>`coalesce(${projects.costUsd}, 0) + ${delta.costUsd}`,
+    })
+    .where(eq(projects.id, projectId))
+    .run();
+
+  return delta;
+}
+
+export function incrementChatSessionTokenUsage(
+  chatSessionId: string,
+  usage: Record<string, unknown> | null | undefined,
+) {
+  const delta = parseTaskTokenUsage(usage);
+  if (delta.total === 0 && delta.costUsd === 0) return delta;
+
+  getDb()
+    .update(chatSessions)
+    .set({
+      tokenInput: sql<number>`coalesce(${chatSessions.tokenInput}, 0) + ${delta.input}`,
+      tokenOutput: sql<number>`coalesce(${chatSessions.tokenOutput}, 0) + ${delta.output}`,
+      tokenTotal: sql<number>`coalesce(${chatSessions.tokenTotal}, 0) + ${delta.total}`,
+      costUsd: sql<number>`coalesce(${chatSessions.costUsd}, 0) + ${delta.costUsd}`,
+    })
+    .where(eq(chatSessions.id, chatSessionId))
+    .run();
+
+  return delta;
+}
+
+// ---------------------------------------------------------------------------
+// Usage event sink — structural type matching `@aif/runtime`'s RuntimeUsageSink
+// ---------------------------------------------------------------------------
+
+/**
+ * Structural shape of a usage event. Mirrors `RuntimeUsageEvent` from
+ * `@aif/runtime/usageSink` without an import so `@aif/data` stays free of
+ * a dependency on `@aif/runtime` (runtime → shared → data is the intended
+ * direction; data must not know about the runtime layer).
+ *
+ * The host process (api or agent) passes `createDbUsageSink()` to
+ * `createRuntimeRegistry({ usageSink })`, where TypeScript's structural
+ * typing verifies that the returned object satisfies `RuntimeUsageSink`.
+ */
+export interface DbUsageEvent {
+  context: {
+    source: string;
+    projectId?: string | null;
+    taskId?: string | null;
+    chatSessionId?: string | null;
+  };
+  runtimeId: string;
+  providerId: string;
+  profileId?: string | null;
+  transport?: string;
+  workflowKind?: string;
+  usageReporting: string;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    costUsd?: number;
+  };
+  recordedAt: Date;
+}
+
+export interface DbUsageSink {
+  record(event: DbUsageEvent): void;
+}
+
+/**
+ * Insert a `usage_events` row and roll the usage delta into whichever
+ * per-entity aggregate counters the event has scope for (task, project,
+ * chat-session). Any subset of scopes may be present — a chat turn has
+ * project + chat-session but no task; a subagent run has project + task
+ * but no chat-session; a commit run has only project.
+ *
+ * Runs all four writes in a single transaction so the append-only log and
+ * the rolled-up counters stay consistent.
+ */
+export function recordUsageEvent(event: DbUsageEvent): void {
+  const { usage, context } = event;
+  const db = getDb();
+
+  // Wrap insert + aggregate updates in a single transaction so the
+  // append-only log and rolled-up counters stay consistent. If any
+  // update fails the entire batch rolls back — no partial divergence.
+  db.transaction((tx) => {
+    tx.insert(usageEvents)
+      .values({
+        source: context.source,
+        projectId: context.projectId ?? null,
+        taskId: context.taskId ?? null,
+        chatSessionId: context.chatSessionId ?? null,
+        runtimeId: event.runtimeId,
+        providerId: event.providerId,
+        profileId: event.profileId ?? null,
+        transport: event.transport ?? null,
+        workflowKind: event.workflowKind ?? null,
+        usageReporting: event.usageReporting,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        totalTokens: usage.totalTokens,
+        costUsd: usage.costUsd ?? null,
+      })
+      .run();
+
+    // Use usage.totalTokens (the provider's authoritative total) for all
+    // aggregates — same source of truth as the usage_events row. Never
+    // recalculate as inputTokens + outputTokens: providers may include
+    // additional token categories (cache, reasoning, etc.) in their total.
+    const totalTokensDelta = usage.totalTokens;
+    const costDelta = usage.costUsd ?? 0;
+
+    if (context.taskId) {
+      tx.update(tasks)
+        .set({
+          tokenInput: sql<number>`coalesce(${tasks.tokenInput}, 0) + ${usage.inputTokens}`,
+          tokenOutput: sql<number>`coalesce(${tasks.tokenOutput}, 0) + ${usage.outputTokens}`,
+          tokenTotal: sql<number>`coalesce(${tasks.tokenTotal}, 0) + ${totalTokensDelta}`,
+          costUsd: sql<number>`coalesce(${tasks.costUsd}, 0) + ${costDelta}`,
+        })
+        .where(eq(tasks.id, context.taskId))
+        .run();
+    }
+    if (context.projectId) {
+      tx.update(projects)
+        .set({
+          tokenInput: sql<number>`coalesce(${projects.tokenInput}, 0) + ${usage.inputTokens}`,
+          tokenOutput: sql<number>`coalesce(${projects.tokenOutput}, 0) + ${usage.outputTokens}`,
+          tokenTotal: sql<number>`coalesce(${projects.tokenTotal}, 0) + ${totalTokensDelta}`,
+          costUsd: sql<number>`coalesce(${projects.costUsd}, 0) + ${costDelta}`,
+        })
+        .where(eq(projects.id, context.projectId))
+        .run();
+    }
+    if (context.chatSessionId) {
+      tx.update(chatSessions)
+        .set({
+          tokenInput: sql<number>`coalesce(${chatSessions.tokenInput}, 0) + ${usage.inputTokens}`,
+          tokenOutput: sql<number>`coalesce(${chatSessions.tokenOutput}, 0) + ${usage.outputTokens}`,
+          tokenTotal: sql<number>`coalesce(${chatSessions.tokenTotal}, 0) + ${totalTokensDelta}`,
+          costUsd: sql<number>`coalesce(${chatSessions.costUsd}, 0) + ${costDelta}`,
+        })
+        .where(eq(chatSessions.id, context.chatSessionId))
+        .run();
+    }
+  });
+}
+
+/**
+ * Build a `DbUsageSink` (structurally compatible with
+ * `@aif/runtime.RuntimeUsageSink`) that persists every event via
+ * `recordUsageEvent`. Sink methods are non-throwing: any DB error is logged
+ * and swallowed so a broken sink never breaks the caller mid-run.
+ */
+export function createDbUsageSink(): DbUsageSink {
+  return {
+    record(event) {
+      try {
+        recordUsageEvent(event);
+      } catch (err) {
+        log.error(
+          {
+            err,
+            runtimeId: event.runtimeId,
+            source: event.context.source,
+          },
+          "Failed to record usage event — dropping silently",
+        );
+      }
+    },
+  };
 }
 
 /**

@@ -20,6 +20,15 @@ import type {
   UpdateRuntimeProfileInput,
 } from "@aif/shared/browser";
 
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 export interface AifConfig {
   language?: {
     ui?: string;
@@ -73,6 +82,7 @@ const IMPORT_ROADMAP_TIMEOUT_MS = 300_000;
 export interface SettingsResponse {
   useSubagents: boolean;
   maxReviewIterations: number;
+  autoReviewStrategy: "full_re_review" | "closure_first";
   runtimeReadiness: {
     availableRuntimeCount: number;
     runtimeProfileCount: number;
@@ -137,7 +147,7 @@ async function request<T>(
         message = firstFieldError[0] ?? null;
       }
     }
-    throw new Error(message ?? `HTTP ${res.status}`);
+    throw new ApiError(message ?? `HTTP ${res.status}`, res.status);
   }
 
   return res.json();
@@ -168,6 +178,19 @@ export const api = {
     return request<Project>(`/projects/${id}`, {
       method: "PUT",
       body: JSON.stringify(input),
+    });
+  },
+
+  getAutoQueueMode(id: string): Promise<{ enabled: boolean }> {
+    console.debug("[api] GET /projects/%s/auto-queue-mode", id);
+    return request<{ enabled: boolean }>(`/projects/${id}/auto-queue-mode`);
+  },
+
+  setAutoQueueMode(id: string, enabled: boolean): Promise<{ enabled: boolean }> {
+    console.debug("[api] PATCH /projects/%s/auto-queue-mode", id, enabled);
+    return request<{ enabled: boolean }>(`/projects/${id}/auto-queue-mode`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled }),
     });
   },
 
