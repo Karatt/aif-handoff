@@ -581,10 +581,12 @@ describe("executeSubagentQuery planner warmup fork", () => {
       systemRuntimeProfileId: null,
     });
     mockEnvOverrides.AIF_WARMUP_ENABLED = true;
+    mockEnvOverrides.AIF_RUNTIME_SESSION_FORK_ENABLED = true;
   });
 
   afterEach(() => {
     delete mockEnvOverrides.AIF_WARMUP_ENABLED;
+    delete mockEnvOverrides.AIF_RUNTIME_SESSION_FORK_ENABLED;
     vi.unstubAllGlobals();
   });
 
