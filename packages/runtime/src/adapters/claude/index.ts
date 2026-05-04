@@ -1,5 +1,6 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { findClaudePath } from "./findPath.js";
+import { getEnv } from "@aif/shared";
+import { findClaudePath, resolveClaudeSdkExecutablePath } from "./findPath.js";
 import {
   RuntimeTransport,
   UsageReporting,
@@ -15,9 +16,11 @@ import {
   type RuntimeRunResult,
   type RuntimeSession,
   type RuntimeSessionEventsInput,
+  type RuntimeSessionForkInput,
   type RuntimeSessionGetInput,
   type RuntimeSessionListInput,
 } from "../../types.js";
+import { RuntimeCapabilityError, RuntimeExecutionError } from "../../errors.js";
 import { diagnoseClaudeError } from "./diagnostics.js";
 import { getClaudeMcpStatus, installClaudeMcpServer, uninstallClaudeMcpServer } from "./mcp.js";
 import { initClaudeProject } from "./project.js";
@@ -77,7 +80,7 @@ const DEFAULT_MODEL_DISCOVERY_TIMEOUT_MS = 8_000;
 function createFallbackLogger(): ClaudeRuntimeAdapterLogger {
   return {
     debug(context, message) {
-      console.debug("DEBUG [runtime:claude]", message, context);
+      console.debug("[runtime:claude]", message, context);
     },
     info(context, message) {
       console.info("INFO [runtime:claude]", message, context);
@@ -98,6 +101,7 @@ function createFallbackLogger(): ClaudeRuntimeAdapterLogger {
 /** SDK transport has full capabilities. */
 const SDK_CAPABILITIES: RuntimeCapabilities = {
   supportsResume: true,
+  supportsSessionFork: true,
   supportsSessionList: true,
   supportsAgentDefinitions: true,
   supportsStreaming: true,
@@ -105,6 +109,7 @@ const SDK_CAPABILITIES: RuntimeCapabilities = {
   supportsApprovals: true,
   supportsCustomEndpoint: true,
   usageReporting: UsageReporting.FULL,
+  supportsInteractiveQuestions: true,
 };
 
 /**
@@ -113,6 +118,7 @@ const SDK_CAPABILITIES: RuntimeCapabilities = {
  */
 const CLI_CAPABILITIES: RuntimeCapabilities = {
   supportsResume: true,
+  supportsSessionFork: true,
   supportsSessionList: true,
   supportsAgentDefinitions: true,
   supportsStreaming: false,
@@ -120,11 +126,13 @@ const CLI_CAPABILITIES: RuntimeCapabilities = {
   supportsApprovals: false,
   supportsCustomEndpoint: false,
   usageReporting: UsageReporting.FULL,
+  supportsInteractiveQuestions: true,
 };
 
 /** API transport — requires explicit key + baseUrl, no agent definitions. */
 const API_CAPABILITIES: RuntimeCapabilities = {
   supportsResume: false,
+  supportsSessionFork: false,
   supportsSessionList: false,
   supportsAgentDefinitions: false,
   supportsStreaming: true,
@@ -134,15 +142,64 @@ const API_CAPABILITIES: RuntimeCapabilities = {
   usageReporting: UsageReporting.FULL,
 };
 
+function withSessionForkRolloutGate(capabilities: RuntimeCapabilities): RuntimeCapabilities {
+  if (getEnv().AIF_RUNTIME_SESSION_FORK_ENABLED || !capabilities.supportsSessionFork) {
+    return capabilities;
+  }
+  return { ...capabilities, supportsSessionFork: false };
+}
+
 function readStringOption(input: RuntimeConnectionValidationInput, key: string): string | null {
   const options = input.options ?? {};
   const raw = options[key];
   return typeof raw === "string" && raw.trim().length > 0 ? raw.trim() : null;
 }
 
-function normalizeSdkExecutablePath(path: string | null | undefined): string | undefined {
-  if (!path) return undefined;
-  return path.toLowerCase().endsWith(".cmd") ? undefined : path;
+function sessionIdSuffix(sessionId: string | null | undefined): string | null {
+  if (!sessionId) return null;
+  return sessionId.length <= 8 ? sessionId : sessionId.slice(-8);
+}
+
+function normalizeSdkExecutablePath(
+  path: string | null | undefined,
+  logger: ClaudeRuntimeAdapterLogger,
+  runtimeId: string,
+  options: { explicitPath?: boolean } = {},
+): string | undefined {
+  const normalized = resolveClaudeSdkExecutablePath(path, process.platform, {
+    allowBareUnixExecutable: options.explicitPath,
+  });
+  if (process.platform !== "win32" || !path) {
+    if (path && !normalized) {
+      logger.warn(
+        {
+          runtimeId,
+          wrapperPath: path,
+        },
+        "Dropped auto-discovered Claude SDK wrapper path and deferred to Agent SDK lookup",
+      );
+    }
+    return normalized;
+  }
+  if (normalized && normalized !== path) {
+    logger.info(
+      {
+        runtimeId,
+        wrapperPath: path,
+        nativeExecutablePath: normalized,
+      },
+      "Resolved Claude SDK wrapper path to native executable",
+    );
+  } else if (!normalized) {
+    logger.warn(
+      {
+        runtimeId,
+        wrapperPath: path,
+      },
+      "Dropped Claude SDK wrapper path and deferred to Agent SDK lookup",
+    );
+  }
+  return normalized;
 }
 
 function toClaudeModelDiscoveryInput(input: RuntimeModelListInput): RuntimeRunInput {
@@ -234,6 +291,9 @@ async function listClaudeModels(
   const execution = parseExecutionOptions(discoveryInput, {
     pathToClaudeCodeExecutable: normalizeSdkExecutablePath(
       configuredCliPath ?? adapterDefaults?.pathToClaudeCodeExecutable,
+      logger,
+      input.runtimeId,
+      { explicitPath: Boolean(configuredCliPath) },
     ),
   });
   const modelDiscoveryAbortController = new AbortController();
@@ -279,7 +339,7 @@ async function listClaudeModels(
       hasAnthropicApiKey: Boolean(envRecord.ANTHROPIC_API_KEY),
       hasBaseUrl: typeof envRecord.ANTHROPIC_BASE_URL === "string",
     },
-    "DEBUG [runtime:claude] Starting Claude model discovery",
+    "[runtime:claude] Starting Claude model discovery",
   );
   let session: ReturnType<typeof query> | null = null;
   const discoveryStartedAt = Date.now();
@@ -309,7 +369,7 @@ async function listClaudeModels(
         discoveryDurationMs: Date.now() - discoveryStartedAt,
         timeoutMs,
       },
-      "DEBUG [runtime:claude] Claude model discovery finished",
+      "[runtime:claude] Claude model discovery finished",
     );
     if (models.length > 0) {
       return models.map((model) => ({
@@ -439,12 +499,10 @@ export function createClaudeRuntimeAdapter(
   const logger = options.logger ?? createFallbackLogger();
   const executablePath = options.executablePath ?? findClaudePath();
 
-  // On Windows, npm installs produce `.cmd` wrappers (e.g. claude.cmd).
-  // The Anthropic SDK spawns `pathToClaudeCodeExecutable` directly without
-  // shell, so passing a `.cmd` path causes EINVAL. For SDK transport, omit
-  // the path and let the SDK resolve it via its own lookup. CLI transport
-  // already uses `shell: true` on Windows so `.cmd` works there.
-  const sdkExecutablePath = executablePath?.endsWith(".cmd") ? undefined : executablePath;
+  // On Windows, PATH discovery often returns npm/nvm wrapper scripts like
+  // `claude`, `claude.cmd`, or `claude.ps1`. The Agent SDK requires the real
+  // native `claude.exe`, while CLI transport can keep using the shell wrapper.
+  const sdkExecutablePath = normalizeSdkExecutablePath(executablePath, logger, runtimeId);
 
   function runByTransport(input: RuntimeRunInput): Promise<RuntimeRunResult> {
     const transport = input.transport ?? RuntimeTransport.SDK;
@@ -453,6 +511,64 @@ export function createClaudeRuntimeAdapter(
     }
     // SDK and API both go through the Agent SDK runtime
     return runClaudeRuntime(input, logger, { pathToClaudeCodeExecutable: sdkExecutablePath });
+  }
+
+  async function forkByTransport(input: RuntimeSessionForkInput): Promise<RuntimeRunResult> {
+    const transport = input.transport ?? RuntimeTransport.SDK;
+    if (transport === RuntimeTransport.API) {
+      logger.warn(
+        {
+          runtimeId,
+          profileId: input.profileId ?? null,
+          transport,
+          sourceSessionIdSuffix: sessionIdSuffix(input.sourceSessionId),
+          skipReason: "unsupported_transport",
+        },
+        "WARN [runtime:claude] Session fork requested for unsupported transport",
+      );
+      throw new RuntimeCapabilityError(
+        `Claude ${transport} transport does not support session fork`,
+      );
+    }
+
+    logger.debug(
+      {
+        runtimeId,
+        profileId: input.profileId ?? null,
+        transport,
+        sourceSessionIdSuffix: sessionIdSuffix(input.sourceSessionId),
+      },
+      "DEBUG [runtime:claude] Starting Claude session fork run",
+    );
+
+    try {
+      const result = await runByTransport(input);
+      logger.debug(
+        {
+          runtimeId,
+          profileId: input.profileId ?? null,
+          transport,
+          sourceSessionIdSuffix: sessionIdSuffix(input.sourceSessionId),
+          childSessionIdSuffix: sessionIdSuffix(result.sessionId ?? result.session?.id ?? null),
+        },
+        "DEBUG [runtime:claude] Claude session fork run completed",
+      );
+      return result;
+    } catch (error) {
+      logger.error(
+        {
+          runtimeId,
+          profileId: input.profileId ?? null,
+          transport,
+          sourceSessionIdSuffix: sessionIdSuffix(input.sourceSessionId),
+          category: error instanceof RuntimeExecutionError ? error.category : null,
+          adapterCode: error instanceof RuntimeExecutionError ? error.adapterCode : null,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "ERROR [runtime:claude] Claude session fork run failed",
+      );
+      throw error;
+    }
   }
 
   return {
@@ -468,16 +584,16 @@ export function createClaudeRuntimeAdapter(
       defaultModelPlaceholder: "opus",
       defaultTransport: RuntimeTransport.SDK,
       supportedTransports: [RuntimeTransport.SDK, RuntimeTransport.CLI, RuntimeTransport.API],
-      capabilities: SDK_CAPABILITIES,
+      capabilities: withSessionForkRolloutGate(SDK_CAPABILITIES),
     },
     getEffectiveCapabilities(transport: RuntimeTransport): RuntimeCapabilities {
       switch (transport) {
         case RuntimeTransport.CLI:
-          return CLI_CAPABILITIES;
+          return withSessionForkRolloutGate(CLI_CAPABILITIES);
         case RuntimeTransport.API:
           return API_CAPABILITIES;
         default:
-          return SDK_CAPABILITIES;
+          return withSessionForkRolloutGate(SDK_CAPABILITIES);
       }
     },
     async run(input: RuntimeRunInput): Promise<RuntimeRunResult> {
@@ -485,6 +601,9 @@ export function createClaudeRuntimeAdapter(
     },
     async resume(input: RuntimeRunInput & { sessionId: string }): Promise<RuntimeRunResult> {
       return runByTransport({ ...input, resume: true });
+    },
+    async forkSession(input: RuntimeSessionForkInput): Promise<RuntimeRunResult> {
+      return forkByTransport(input);
     },
     async listSessions(input: RuntimeSessionListInput): Promise<RuntimeSession[]> {
       return listClaudeRuntimeSessions(input);

@@ -40,6 +40,7 @@ const DEFAULT_OPENROUTER_MODELS: RuntimeModel[] = [
 
 const API_CAPABILITIES: RuntimeCapabilities = {
   supportsResume: false,
+  supportsSessionFork: false,
   supportsSessionList: false,
   supportsAgentDefinitions: false,
   supportsStreaming: true,
@@ -52,7 +53,7 @@ const API_CAPABILITIES: RuntimeCapabilities = {
 function createFallbackLogger(): OpenRouterAdapterLogger {
   return {
     debug(context, message) {
-      console.debug("DEBUG [runtime:openrouter]", message, context);
+      console.debug("[runtime:openrouter]", message, context);
     },
     info(context, message) {
       console.info("INFO [runtime:openrouter]", message, context);

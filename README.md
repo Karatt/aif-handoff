@@ -15,7 +15,7 @@ Auto-review is now convergence-aware. You can keep the default `full_re_review` 
 Use the runtime that fits your stack today, then switch per project/task without changing orchestration logic:
 
 - **Claude (`anthropic`)** — SDK, CLI, API transports
-- **Codex (`openai`)** — SDK, CLI, API transports
+- **Codex (`openai`)** — SDK, CLI, App Server, API transports
 - **OpenRouter (`openrouter`)** — API transport
 - **OpenCode (`opencode`)** — API transport
 
@@ -29,7 +29,7 @@ Need something custom? Add your own runtime adapter module and load it at startu
 - **Beautiful Kanban UI** — drag-and-drop board with real-time WebSocket updates
 - **AI Factory core** — built on [ai-factory](https://github.com/lee-to/ai-factory) agent definitions and skill system
 - **Subagent orchestration** — plan-coordinator, implement-coordinator, review + security sidecars
-- **Runtime/provider modularity** — runtime registry, project/task runtime profile selection, and provider-specific capability gating
+- **Runtime/provider modularity** — runtime registry, global/project/task runtime profile selection, and provider-specific capability gating
 - **Layer-aware execution** — implementer computes dependency layers and enforces parallel worker dispatch where possible
 - **Self-healing pipeline** — heartbeat + stale-stage watchdog auto-recovers stuck agent stages
 - **Human-in-the-loop** — approve plans, request changes, or let auto-mode handle everything
@@ -78,7 +78,42 @@ The agent coordinator reacts to task events via WebSocket in near real-time and 
   ```
   Copy the URL and open it in your browser. **Important:** the terminal wraps long URLs across lines — remove any line breaks and spaces before pasting, otherwise OAuth will fail with `invalid code_challenge`. Then restart to apply. Credentials are stored in a persistent `claude-auth` Docker volume.
 
-For Codex/OpenAI-compatible profiles, configure `OPENAI_API_KEY` and optionally `OPENAI_BASE_URL` (or set profile-level `apiKeyEnvVar` / `baseUrl`). See [Providers](docs/providers.md).
+For Codex/OpenAI-compatible profiles, configure `OPENAI_API_KEY` and optionally `OPENAI_BASE_URL` (or set profile-level `apiKeyEnvVar` / `baseUrl`). For local Codex runs without API keys, prefer `transport: "app-server"` or `transport: "cli"` and authenticate via `codex login`. See [Providers](docs/providers.md).
+
+#### Codex OAuth in Docker (without `OPENAI_API_KEY`)
+
+The dev compose wires up a small in-container broker that runs
+`codex login --device-auth` and exposes a guided UI in
+**Settings → Runtime profile → Codex**:
+
+1. Click **Start Codex login**. The broker spawns the CLI and reads back a
+   verification URL plus a one-time code.
+2. Open the verification page in your browser, enter the code, and complete
+   ChatGPT sign-in.
+3. The CLI exits 0 once ChatGPT confirms and writes `~/.codex/auth.json` to
+   the persistent `codex-auth` volume. The wizard flips to success
+   automatically (status polled every second).
+4. Run `docker compose restart agent` to pick up the credentials.
+
+**Production note:** the broker is **dev-only**. `docker-compose.production.yml`
+sets `AIF_ENABLE_CODEX_LOGIN_PROXY=false`. For production, configure
+`OPENAI_API_KEY` in `.env` instead.
+
+### Runtime Defaults
+
+Runtime profiles can now be managed at two scopes:
+
+- **Global profiles** live in Global Settings and can be reused across every project
+- **Project profiles** stay local to a single project
+
+Effective runtime resolution follows this order:
+
+1. task override
+2. project default
+3. app default
+4. environment fallback
+
+Planning and review keep their own defaults, but when those are unset they inherit from the task default at the same scope. Chat has its own dedicated project/app default chain.
 
 ### OpenCode Quick Setup
 
@@ -144,23 +179,23 @@ AIF Handoff supports two execution modes, configurable globally via `AGENT_USE_S
 
 | Mode          | `AGENT_USE_SUBAGENTS` | How it works                                                                                                                                                                                                  | Trade-off                                                                                                                                                            |
 | ------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Subagents** | `true` (default)      | Each stage runs through specialized coordinator agents (`plan-coordinator`, `implement-coordinator`, `review-sidecar` + `security-sidecar`) that iteratively refine the result until quality criteria are met | Higher quality — plans are polished in multiple rounds, implementation gets parallel workers with quality sidecars, reviews are thorough. Takes more time and tokens |
-| **Skills**    | `false`               | Each stage runs as a single-pass AIF skill (`/aif-plan`, `/aif-implement`, `/aif-review`, `/aif-security-checklist`)                                                                                          | Faster execution with lower token usage, but no iterative refinement — good enough for simpler tasks or quick prototyping                                            |
+| **Subagents** | `true`                | Each stage runs through specialized coordinator agents (`plan-coordinator`, `implement-coordinator`, `review-sidecar` + `security-sidecar`) that iteratively refine the result until quality criteria are met | Higher quality — plans are polished in multiple rounds, implementation gets parallel workers with quality sidecars, reviews are thorough. Takes more time and tokens |
+| **Skills**    | `false` (default)     | Each stage runs as a single-pass AIF skill (`/aif-plan`, `/aif-implement`, `/aif-review`, `/aif-security-checklist`)                                                                                          | Faster execution with lower token usage, but no iterative refinement — good enough for simpler tasks or quick prototyping                                            |
 
 ## Tech Stack
 
-| Layer        | Technology                                                    |
-| ------------ | ------------------------------------------------------------- |
-| Runtime      | Node.js + TypeScript                                          |
-| Monorepo     | Turborepo                                                     |
-| Database     | SQLite (better-sqlite3 + drizzle-orm)                         |
-| API          | Hono + @hono/node-server + WebSocket                          |
-| Validation   | zod + @hono/zod-validator                                     |
-| Frontend     | React + Vite + TailwindCSS                                    |
-| Drag & Drop  | @dnd-kit                                                      |
-| Server State | @tanstack/react-query                                         |
-| Runtime SDKs | Pluggable adapters — Claude (Agent SDK) + Codex (CLI/SDK/API) |
-| Scheduler    | node-cron                                                     |
+| Layer        | Technology                                                               |
+| ------------ | ------------------------------------------------------------------------ |
+| Runtime      | Node.js + TypeScript                                                     |
+| Monorepo     | Turborepo                                                                |
+| Database     | SQLite (better-sqlite3 + drizzle-orm)                                    |
+| API          | Hono + @hono/node-server + WebSocket                                     |
+| Validation   | zod + @hono/zod-validator                                                |
+| Frontend     | React + Vite + TailwindCSS                                               |
+| Drag & Drop  | @dnd-kit                                                                 |
+| Server State | @tanstack/react-query                                                    |
+| Runtime SDKs | Pluggable adapters — Claude (Agent SDK) + Codex (CLI/SDK/App Server/API) |
+| Scheduler    | node-cron                                                                |
 
 ## Docker
 
@@ -184,18 +219,30 @@ Authentication: set `ANTHROPIC_API_KEY` in `.env`, or log in via `docker compose
 
 Only ports 80/443 are exposed. API is bound to localhost only. Includes security hardening (no-new-privileges, resource limits), healthchecks, log rotation, and automatic SSL via Let's Encrypt (ACME).
 
-| Variable            | Default      | Description                               |
-| ------------------- | ------------ | ----------------------------------------- |
-| `ANTHROPIC_API_KEY` | —            | API key (or use `claude login`)           |
-| `DOMAIN`            | `localhost`  | Domain for SSL certificate (ACME)         |
-| `PORT`              | `3009`       | Host port for API                         |
-| `MCP_PORT`          | `3100`       | Host port for MCP HTTP server (`1-65535`) |
-| `WEB_PORT`          | `5180`       | Host port for Web UI (dev)                |
-| `WEB_HOST`          | `localhost`  | Web UI dev server host (Vite)             |
-| `HTTP_PORT`         | `80`         | Host port for Web UI (production)         |
-| `HTTPS_PORT`        | `443`        | HTTPS port (production)                   |
-| `PROJECTS_DIR`      | `./projects` | Host directory for project files (dev)    |
-| `PROJECTS_MOUNT`    | `/home/www`  | Project files path inside containers      |
+| Variable             | Default      | Description                                                  |
+| -------------------- | ------------ | ------------------------------------------------------------ |
+| `ANTHROPIC_API_KEY`  | —            | API key (or use `claude login`)                              |
+| `DOMAIN`             | `localhost`  | Domain for SSL certificate (ACME)                            |
+| `PORT`               | `3009`       | Host port for API                                            |
+| `MCP_PORT`           | `3100`       | Host port for MCP HTTP server (`1-65535`)                    |
+| `WEB_PORT`           | `5180`       | Host port for Web UI (dev)                                   |
+| `WEB_HOST`           | `localhost`  | Web UI dev server host (Vite)                                |
+| `HTTP_PORT`          | `80`         | Host port for Web UI (production)                            |
+| `HTTPS_PORT`         | `443`        | HTTPS port (production)                                      |
+| `PROJECTS_DIR`       | `./projects` | Host directory for project files (dev)                       |
+| `PROJECTS_MOUNT`     | `/home/www`  | Project files path inside containers                         |
+| `PROJECTS_HOST_ROOT` | `${PWD}`     | Compose-internal repo root for relative `PROJECTS_DIR` (dev) |
+
+In the dev Compose setup, project roots are used by processes inside the
+containers. Host paths under `PROJECTS_DIR` are accepted in the UI and
+automatically saved as the matching `PROJECTS_MOUNT` path, so
+`/Users/me/projects/app` becomes `/home/www/app` with the default mount. If
+`PROJECTS_DIR` is relative, Compose resolves it from `PROJECTS_HOST_ROOT`; leave
+`PROJECTS_HOST_ROOT` unset unless you are replacing the compose wiring.
+
+Production Compose uses a named Docker volume at `PROJECTS_MOUNT` instead of
+the dev bind mount. Create and select projects by their in-container path in
+production, for example `/home/www/app`.
 
 A `.devcontainer/` config is also included for JetBrains / VS Code.
 
@@ -212,7 +259,7 @@ A `.devcontainer/` config is also included for JetBrains / VS Code.
 
 ## Troubleshooting
 
-If your workflow runs for too long and frequently times out, try disabling subagents in your environment:
+If you enabled subagents and the workflow runs for too long or frequently times out, disable them in your environment (this is the default):
 
 ```env
 AGENT_USE_SUBAGENTS=false

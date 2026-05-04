@@ -13,7 +13,16 @@ export {
   type RuntimeMcpStatus,
   type RuntimeEvent,
   type RuntimeExecutionIntent,
+  type RuntimeLimitEventPayload,
+  RuntimeLimitPrecision,
+  RuntimeLimitScope,
+  type RuntimeLimitSnapshot,
+  RuntimeLimitSource,
+  RuntimeLimitStatus,
+  type RuntimeLimitWindow,
+  RUNTIME_LIMIT_EVENT_TYPE,
   type RuntimeSubagentStartCallback,
+  type RuntimeToolQuestionPayload,
   type RuntimeToolUseCallback,
   type RuntimeModel,
   type RuntimeModelListInput,
@@ -21,6 +30,7 @@ export {
   type RuntimeRunResult,
   type RuntimeSession,
   type RuntimeSessionEventsInput,
+  type RuntimeSessionForkInput,
   type RuntimeSessionGetInput,
   type RuntimeSessionListInput,
   isRuntimeTransport,
@@ -33,6 +43,12 @@ export {
 } from "./types.js";
 
 export { createNoopUsageSink, type RuntimeUsageEvent, type RuntimeUsageSink } from "./usageSink.js";
+
+export {
+  buildToolUseEvents,
+  toolQuestionEvent,
+  type BuildToolUseEventsInput,
+} from "./toolEvents.js";
 
 export {
   type RegisterRuntimeModule,
@@ -53,6 +69,7 @@ export {
   classifyByMessageFallback,
   isExternalFailureCategory,
   isRuntimeErrorCategory,
+  type RuntimeExecutionErrorMetadata,
   type RuntimeErrorCategory,
 } from "./errors.js";
 
@@ -67,12 +84,25 @@ export {
 export {
   assertRuntimeCapabilities,
   checkRuntimeCapabilities,
+  checkRuntimeSessionForkSupport,
   type RuntimeCapabilityCheckInput,
   type RuntimeCapabilityCheckResult,
   type RuntimeCapabilityName,
+  type RuntimeSessionForkSkipReason,
+  type RuntimeSessionForkSupportInput,
+  type RuntimeSessionForkSupportResult,
 } from "./capabilities.js";
 
 export { createRuntimeMemoryCache, type RuntimeCache, type RuntimeCacheOptions } from "./cache.js";
+
+export {
+  buildRuntimeLimitBroadcastCacheKey,
+  buildRuntimeLimitCacheSignature,
+  extractLatestRuntimeLimitSnapshot,
+  extractRuntimeLimitSnapshotFromError,
+  extractRuntimeLimitSnapshotFromEvent,
+  observeRuntimeLimitEvent,
+} from "./limitState.js";
 
 export {
   createRuntimeModelDiscoveryService,
@@ -114,6 +144,8 @@ export {
 
 export { bootstrapRuntimeRegistry, type BootstrapRuntimeRegistryOptions } from "./bootstrap.js";
 
+export { buildLanguageDirective, type LanguageDirectiveInput } from "./languagePolicy.js";
+
 export { initProject, type InitProjectOptions, type InitProjectResult } from "./projectInit.js";
 
 export { isValidTrustToken, RUNTIME_TRUST_TOKEN, type RuntimeTrustToken } from "./trust.js";
@@ -131,6 +163,19 @@ export {
   withProcessTimeouts,
   withStreamTimeouts,
 } from "./timeouts.js";
+
+export {
+  buildRuntimeLimitSignature,
+  mapSafeRuntimeErrorReason,
+  normalizeRuntimeLimitSnapshot,
+  resolveRuntimeLimitFutureHint,
+  sanitizeProviderMeta,
+  selectViolatedWindowForExactThreshold,
+  type RuntimeLimitFutureHint,
+  type RuntimeLimitFutureHintSource,
+  type SafeRuntimeErrorCategory,
+  type SafeRuntimeErrorReason,
+} from "@aif/shared";
 
 /**
  * Adapter factories are intentionally NOT re-exported from the package root.
@@ -152,6 +197,39 @@ export type {
   CodexRuntimeAdapterLogger,
   CreateCodexRuntimeAdapterOptions,
 } from "./adapters/codex/index.js";
+
+export {
+  buildCodexAuthFingerprint,
+  classifyCodexSessionFileStatus,
+  findCodexSessionFileInfoById,
+  getCodexAuthIdentity,
+  listCodexSessionFileInfos,
+  listLatestCodexLimitSnapshots,
+  normalizeCodexProjectPath,
+  readCodexSessionEventsFromFile,
+  readCodexSessionLimitSnapshotsFromAppend,
+  readCodexSessionLimitSnapshotsFromFile,
+  readCodexSessionMetaFromFile,
+  readCodexSnapshotAccountFingerprint,
+  readLatestCodexSessionLimitSnapshotFromFile,
+  getLatestCodexModelLimitSnapshot,
+  selectPreferredCodexLimitSnapshot,
+  type CodexAuthIdentity,
+  type CodexAppendLimitSnapshotsResult,
+  type CodexIndexedFileState,
+  type CodexSessionFileInfo,
+  type CodexSessionFileStatus,
+  type CodexSessionMeta,
+} from "./adapters/codex/sessions.js";
+export {
+  ClaudeProviderFamily,
+  resolveClaudeProviderAuth,
+  resolveClaudeProviderIdentity,
+  type ClaudeLocalSettingsIdentity,
+  type ClaudeProviderFamily as ClaudeProviderFamilyType,
+  type ClaudeProviderIdentity,
+  type ResolveClaudeProviderIdentityInput,
+} from "./adapters/claude/providerIdentity.js";
 
 export type {
   CreateOpenCodeRuntimeAdapterOptions,

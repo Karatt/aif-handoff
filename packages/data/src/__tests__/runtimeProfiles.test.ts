@@ -1,5 +1,13 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
-import { projects } from "@aif/shared";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { eq } from "drizzle-orm";
+import {
+  appSettings,
+  projects,
+  resetEnvCache,
+  runtimeProfiles,
+  tasks,
+  usageEvents,
+} from "@aif/shared";
 import { createTestDb } from "@aif/shared/server";
 
 const testDb = { current: createTestDb() };
@@ -11,6 +19,8 @@ vi.mock("@aif/shared/server", async (importOriginal) => {
   };
 });
 
+const dataModule = await import("../index.js");
+
 const {
   createProject,
   findProjectById,
@@ -21,14 +31,53 @@ const {
   createRuntimeProfile,
   findRuntimeProfileById,
   updateRuntimeProfile,
+  persistRuntimeProfileLimitSnapshot,
+  clearRuntimeProfileLimitSnapshot,
   deleteRuntimeProfile,
   listRuntimeProfiles,
+  getRuntimeProfileResponseById,
   toRuntimeProfileResponse,
   updateProjectRuntimeDefaults,
   updateTaskRuntimeOverride,
+  persistTaskRuntimeLimitSnapshot,
+  clearTaskRuntimeLimitSnapshot,
+  blockTaskForRuntimeGateIfEligible,
   updateChatSessionRuntime,
   resolveEffectiveRuntimeProfile,
-} = await import("../index.js");
+  toTaskResponse,
+  evaluateRuntimeLimitGate,
+  upsertCodexLimitHeads,
+  listCodexLimitHeadsForOverlay,
+  findPreferredCodexLimitHeadForOverlay,
+} = dataModule;
+
+const dataModuleWithAppSettings = dataModule as unknown as {
+  getAppSettings?: () => {
+    id: number;
+    defaultTaskRuntimeProfileId: string | null;
+    defaultPlanRuntimeProfileId: string | null;
+    defaultReviewRuntimeProfileId: string | null;
+    defaultChatRuntimeProfileId: string | null;
+  };
+  updateAppSettings?: (input: {
+    defaultTaskRuntimeProfileId?: string | null;
+    defaultPlanRuntimeProfileId?: string | null;
+    defaultReviewRuntimeProfileId?: string | null;
+    defaultChatRuntimeProfileId?: string | null;
+  }) => {
+    id: number;
+    defaultTaskRuntimeProfileId: string | null;
+    defaultPlanRuntimeProfileId: string | null;
+    defaultReviewRuntimeProfileId: string | null;
+    defaultChatRuntimeProfileId: string | null;
+  } | undefined;
+  isRuntimeProfileVisibleToProject?: (input: {
+    projectId: string;
+    runtimeProfileId: string | null;
+  }) => boolean;
+  isRuntimeProfileEligibleForAppDefaults?: (runtimeProfileId: string | null) => boolean;
+  getAppDefaultRuntimeProfileId?: (mode: "task" | "plan" | "review" | "chat") => string | null;
+};
 
 function seedProject(id = "proj-1") {
   testDb.current
@@ -37,10 +86,50 @@ function seedProject(id = "proj-1") {
     .run();
 }
 
+function makeLimitSnapshot() {
+  return {
+    source: "sdk_event" as const,
+    status: "warning" as const,
+    precision: "heuristic" as const,
+    checkedAt: "2026-04-17T10:00:00.000Z",
+    providerId: "anthropic",
+    runtimeId: "claude",
+    profileId: "profile-1",
+    primaryScope: "time" as const,
+    resetAt: "2026-04-17T15:00:00.000Z",
+    retryAfterSeconds: null,
+    warningThreshold: null,
+    windows: [
+      {
+        scope: "time" as const,
+        percentUsed: 92,
+        percentRemaining: 8,
+        resetAt: "2026-04-17T15:00:00.000Z",
+      },
+    ],
+    providerMeta: {
+      rateLimitType: "five_hour",
+    },
+  };
+}
+
 describe("runtime profiles data layer", () => {
+  const previousUsageLimitsEnabled = process.env.AIF_USAGE_LIMITS_ENABLED;
+
   beforeEach(() => {
+    process.env.AIF_USAGE_LIMITS_ENABLED = "true";
+    resetEnvCache();
     testDb.current = createTestDb();
     seedProject();
+  });
+
+  afterEach(() => {
+    if (previousUsageLimitsEnabled == null) {
+      delete process.env.AIF_USAGE_LIMITS_ENABLED;
+    } else {
+      process.env.AIF_USAGE_LIMITS_ENABLED = previousUsageLimitsEnabled;
+    }
+    resetEnvCache();
   });
 
   it("creates and maps runtime profiles", () => {
@@ -81,6 +170,363 @@ describe("runtime profiles data layer", () => {
     expect(updated!.defaultModel).toBe("gpt-5.4");
     expect(updated!.enabled).toBe(false);
     expect(toRuntimeProfileResponse(updated!).options).toEqual({ mode: "cli" });
+  });
+
+  it("attaches the latest recorded usage for each runtime profile", () => {
+    const profile = createRuntimeProfile({
+      projectId: "proj-1",
+      name: "Codex SDK",
+      runtimeId: "codex",
+      providerId: "openai",
+      transport: "sdk",
+      enabled: true,
+    });
+
+    testDb.current
+      .insert(usageEvents)
+      .values([
+        {
+          id: "usage-old",
+          source: "chat",
+          projectId: "proj-1",
+          profileId: profile!.id,
+          runtimeId: "codex",
+          providerId: "openai",
+          transport: "sdk",
+          usageReporting: "full",
+          inputTokens: 10,
+          outputTokens: 5,
+          totalTokens: 15,
+          costUsd: 0.01,
+          createdAt: "2026-04-18T09:00:00.000Z",
+        },
+        {
+          id: "usage-new",
+          source: "chat",
+          projectId: "proj-1",
+          profileId: profile!.id,
+          runtimeId: "codex",
+          providerId: "openai",
+          transport: "sdk",
+          usageReporting: "full",
+          inputTokens: 40,
+          outputTokens: 12,
+          totalTokens: 52,
+          costUsd: 0.03,
+          createdAt: "2026-04-18T10:00:00.000Z",
+        },
+      ])
+      .run();
+
+    const resolved = getRuntimeProfileResponseById(profile!.id);
+
+    expect(resolved?.lastUsage).toEqual({
+      inputTokens: 40,
+      outputTokens: 12,
+      totalTokens: 52,
+      costUsd: 0.03,
+    });
+    expect(resolved?.lastUsageAt).toBe("2026-04-18T10:00:00.000Z");
+  });
+
+  it("persists and clears runtime profile limit snapshots", () => {
+    const profile = createRuntimeProfile({
+      projectId: "proj-1",
+      name: "Claude Default",
+      runtimeId: "claude",
+      providerId: "anthropic",
+    });
+    const snapshot = {
+      ...makeLimitSnapshot(),
+      profileId: profile!.id,
+    };
+
+    const persisted = persistRuntimeProfileLimitSnapshot(
+      profile!.id,
+      snapshot,
+      "2026-04-17T10:00:05.000Z",
+    );
+    const mapped = toRuntimeProfileResponse(persisted!);
+    expect(mapped.runtimeLimitSnapshot).toEqual(snapshot);
+    expect(mapped.runtimeLimitUpdatedAt).toBe("2026-04-17T10:00:05.000Z");
+    expect(persisted!.updatedAt).toBe(profile!.updatedAt);
+
+    const cleared = clearRuntimeProfileLimitSnapshot(profile!.id, "2026-04-17T11:00:00.000Z");
+    const clearedMapped = toRuntimeProfileResponse(cleared!);
+    expect(clearedMapped.runtimeLimitSnapshot).toBeNull();
+    expect(clearedMapped.runtimeLimitUpdatedAt).toBe("2026-04-17T11:00:00.000Z");
+    expect(cleared!.updatedAt).toBe(profile!.updatedAt);
+  });
+
+  it("sanitizes legacy runtime profile providerMeta on read", () => {
+    const profile = createRuntimeProfile({
+      projectId: "proj-1",
+      name: "Legacy Profile",
+      runtimeId: "claude",
+      providerId: "anthropic",
+    });
+
+    testDb.current
+      .update(runtimeProfiles)
+      .set({
+        runtimeLimitSnapshotJson: JSON.stringify({
+          ...makeLimitSnapshot(),
+          profileId: profile!.id,
+          providerMeta: {
+            headers: { authorization: "Bearer SECRET" },
+            raw: { body: "sk-SECRET" },
+            accountLabel: "shared-account",
+          },
+        }),
+      })
+      .where(eq(runtimeProfiles.id, profile!.id))
+      .run();
+
+    const resolved = getRuntimeProfileResponseById(profile!.id);
+
+    expect(resolved?.runtimeLimitSnapshot?.providerMeta).toEqual({
+      accountLabel: "shared-account",
+    });
+    expect(JSON.stringify(resolved)).not.toContain("SECRET");
+  });
+
+  it("does not proactively gate provider-blocked snapshots without reset hints", () => {
+    const profile = createRuntimeProfile({
+      projectId: "proj-1",
+      name: "Claude Default",
+      runtimeId: "claude",
+      providerId: "anthropic",
+    });
+    persistRuntimeProfileLimitSnapshot(
+      profile!.id,
+      {
+        ...makeLimitSnapshot(),
+        status: "blocked",
+        profileId: profile!.id,
+        resetAt: null,
+        windows: [{ scope: "time", percentUsed: 100, percentRemaining: 0, resetAt: null }],
+      },
+      "2026-04-17T10:00:05.000Z",
+    );
+
+    const decision = evaluateRuntimeLimitGate(toRuntimeProfileResponse(findRuntimeProfileById(profile!.id)!), 0);
+    expect(decision.blocked).toBe(false);
+    expect(decision.reason).toBe("none");
+  });
+
+  it("does not write, clear, or gate persisted snapshots when usage limits are disabled", () => {
+    const nowMs = Date.parse("2026-04-17T10:00:00.000Z");
+    const profile = createRuntimeProfile({
+      projectId: "proj-1",
+      name: "Disabled usage limits profile",
+      runtimeId: "codex",
+      providerId: "openai",
+    });
+
+    process.env.AIF_USAGE_LIMITS_ENABLED = "false";
+    resetEnvCache();
+
+    const skippedPersist = persistRuntimeProfileLimitSnapshot(
+      profile!.id,
+      {
+        ...makeLimitSnapshot(),
+        status: "blocked",
+        profileId: profile!.id,
+        resetAt: "2026-04-17T15:00:00.000Z",
+      },
+      "2026-04-17T10:00:05.000Z",
+    );
+    const skippedPersistMapped = toRuntimeProfileResponse(skippedPersist!);
+    expect(skippedPersistMapped.runtimeLimitSnapshot).toBeNull();
+    expect(skippedPersistMapped.runtimeLimitUpdatedAt).toBeNull();
+
+    process.env.AIF_USAGE_LIMITS_ENABLED = "true";
+    resetEnvCache();
+
+    const oldSnapshot = {
+      ...makeLimitSnapshot(),
+      status: "blocked" as const,
+      profileId: profile!.id,
+      resetAt: "2026-04-17T15:00:00.000Z",
+    };
+    persistRuntimeProfileLimitSnapshot(
+      profile!.id,
+      oldSnapshot,
+      "2026-04-17T10:00:05.000Z",
+    );
+
+    process.env.AIF_USAGE_LIMITS_ENABLED = "false";
+    resetEnvCache();
+
+    const skippedClear = clearRuntimeProfileLimitSnapshot(profile!.id, "2026-04-17T11:00:00.000Z");
+    const skippedClearMapped = toRuntimeProfileResponse(skippedClear!);
+    expect(skippedClearMapped.runtimeLimitSnapshot).toEqual(oldSnapshot);
+    expect(skippedClearMapped.runtimeLimitUpdatedAt).toBe("2026-04-17T10:00:05.000Z");
+
+    const decision = evaluateRuntimeLimitGate(
+      toRuntimeProfileResponse(findRuntimeProfileById(profile!.id)!),
+      nowMs,
+    );
+    expect(decision).toEqual({
+      blocked: false,
+      reason: "none",
+      runtimeProfileId: profile!.id,
+      snapshot: null,
+      futureHint: expect.objectContaining({ source: "none", isFuture: false }),
+      violatedWindow: null,
+      signature: null,
+    });
+  });
+
+  it("proactively gates provider-blocked snapshots with retryAfterSeconds even without resetAt", () => {
+    const profile = createRuntimeProfile({
+      projectId: "proj-1",
+      name: "RetryAfter profile",
+      runtimeId: "claude",
+      providerId: "anthropic",
+    });
+    persistRuntimeProfileLimitSnapshot(
+      profile!.id,
+      {
+        ...makeLimitSnapshot(),
+        status: "blocked",
+        profileId: profile!.id,
+        resetAt: null,
+        retryAfterSeconds: 120,
+        windows: [{ scope: "time", percentUsed: 100, percentRemaining: 0, resetAt: null }],
+      },
+      "2026-04-17T10:00:05.000Z",
+    );
+
+    const decision = evaluateRuntimeLimitGate(
+      toRuntimeProfileResponse(findRuntimeProfileById(profile!.id)!),
+      0,
+    );
+    expect(decision.blocked).toBe(true);
+    expect(decision.reason).toBe("provider_blocked");
+    expect(decision.futureHint.source).toBe("snapshot_retry_after");
+  });
+
+  it("proactively gates provider-blocked snapshots with window reset fallback", () => {
+    const nowMs = Date.parse("2026-04-17T10:00:00.000Z");
+    const profile = createRuntimeProfile({
+      projectId: "proj-1",
+      name: "Window reset profile",
+      runtimeId: "claude",
+      providerId: "anthropic",
+    });
+    persistRuntimeProfileLimitSnapshot(
+      profile!.id,
+      {
+        ...makeLimitSnapshot(),
+        status: "blocked",
+        profileId: profile!.id,
+        resetAt: null,
+        retryAfterSeconds: null,
+        windows: [
+          {
+            scope: "time",
+            percentUsed: 100,
+            percentRemaining: 0,
+            resetAt: "2026-04-17T10:30:00.000Z",
+          },
+        ],
+      },
+      "2026-04-17T10:00:05.000Z",
+    );
+
+    const decision = evaluateRuntimeLimitGate(
+      toRuntimeProfileResponse(findRuntimeProfileById(profile!.id)!),
+      nowMs,
+    );
+    expect(decision.blocked).toBe(true);
+    expect(decision.reason).toBe("provider_blocked");
+    expect(decision.futureHint.source).toBe("window_reset_at");
+  });
+
+  it("does not proactively gate exact-threshold warnings without reset hints", () => {
+    const profile = createRuntimeProfile({
+      projectId: "proj-1",
+      name: "OpenAI Default",
+      runtimeId: "codex",
+      providerId: "openai",
+    });
+    persistRuntimeProfileLimitSnapshot(
+      profile!.id,
+      {
+        ...makeLimitSnapshot(),
+        status: "warning",
+        precision: "exact",
+        profileId: profile!.id,
+        resetAt: null,
+        warningThreshold: 10,
+        windows: [
+          {
+            scope: "requests",
+            limit: 100,
+            remaining: 4,
+            used: 96,
+            percentUsed: 96,
+            percentRemaining: 4,
+            warningThreshold: 10,
+            resetAt: null,
+          },
+        ],
+      },
+      "2026-04-17T10:00:05.000Z",
+    );
+
+    const decision = evaluateRuntimeLimitGate(toRuntimeProfileResponse(findRuntimeProfileById(profile!.id)!), 0);
+    expect(decision.blocked).toBe(false);
+    expect(decision.reason).toBe("none");
+  });
+
+  it("uses violated-window reset hint for exact-threshold proactive gate", () => {
+    const nowMs = Date.parse("2026-04-17T10:00:00.000Z");
+    const profile = createRuntimeProfile({
+      projectId: "proj-1",
+      name: "Threshold profile",
+      runtimeId: "openai",
+      providerId: "openai",
+    });
+    persistRuntimeProfileLimitSnapshot(
+      profile!.id,
+      {
+        ...makeLimitSnapshot(),
+        source: "api_headers",
+        status: "warning",
+        precision: "exact",
+        profileId: profile!.id,
+        primaryScope: "requests",
+        resetAt: "2026-04-17T10:05:00.000Z",
+        warningThreshold: 10,
+        windows: [
+          {
+            scope: "requests",
+            percentRemaining: 4,
+            warningThreshold: 10,
+            resetAt: "2026-04-17T11:00:00.000Z",
+          },
+          {
+            scope: "tokens",
+            percentRemaining: 50,
+            warningThreshold: 10,
+            resetAt: "2026-04-17T10:05:00.000Z",
+          },
+        ],
+      },
+      "2026-04-17T10:00:05.000Z",
+    );
+
+    const decision = evaluateRuntimeLimitGate(
+      toRuntimeProfileResponse(findRuntimeProfileById(profile!.id)!),
+      nowMs,
+    );
+    expect(decision.blocked).toBe(true);
+    expect(decision.reason).toBe("exact_threshold");
+    expect(decision.violatedWindow?.scope).toBe("requests");
+    expect(decision.futureHint.source).toBe("window_reset_at");
+    expect(decision.futureHint.resetAt).toBe("2026-04-17T11:00:00.000Z");
   });
 
   it("lists runtime profiles with global fallback", () => {
@@ -137,6 +583,528 @@ describe("runtime profiles data layer", () => {
     const chatAfter = findChatSessionById(chat!.id);
     expect(chatAfter?.runtimeProfileId).toBe(profile!.id);
     expect(chatAfter?.runtimeSessionId).toBe("runtime-session-1");
+  });
+
+  it("persists and clears task runtime limit snapshots", () => {
+    const task = createTask({ projectId: "proj-1", title: "T", description: "D" });
+    const snapshot = makeLimitSnapshot();
+
+    const persisted = persistTaskRuntimeLimitSnapshot(
+      task!.id,
+      snapshot,
+      "2026-04-17T10:00:05.000Z",
+    );
+    const mapped = toTaskResponse(persisted!);
+    expect(mapped.runtimeLimitSnapshot).toEqual(snapshot);
+    expect(mapped.runtimeLimitUpdatedAt).toBe("2026-04-17T10:00:05.000Z");
+    expect(persisted!.updatedAt).toBe(task!.updatedAt);
+
+    const cleared = clearTaskRuntimeLimitSnapshot(task!.id, "2026-04-17T11:00:00.000Z");
+    const clearedMapped = toTaskResponse(cleared!);
+    expect(clearedMapped.runtimeLimitSnapshot).toBeNull();
+    expect(clearedMapped.runtimeLimitUpdatedAt).toBe("2026-04-17T11:00:00.000Z");
+    expect(cleared!.updatedAt).toBe(task!.updatedAt);
+  });
+
+  it("sanitizes legacy task providerMeta on read", () => {
+    const task = createTask({ projectId: "proj-1", title: "Legacy task", description: "D" });
+
+    testDb.current
+      .update(tasks)
+      .set({
+        runtimeLimitSnapshotJson: JSON.stringify({
+          ...makeLimitSnapshot(),
+          providerMeta: {
+            headers: { authorization: "Bearer SECRET" },
+            raw: { body: "sk-SECRET" },
+            accountLabel: "shared-account",
+          },
+        }),
+      })
+      .where(eq(tasks.id, task!.id))
+      .run();
+
+    const resolved = toTaskResponse(findTaskById(task!.id)!);
+
+    expect(resolved.runtimeLimitSnapshot?.providerMeta).toBeNull();
+    expect(JSON.stringify(resolved)).not.toContain("SECRET");
+  });
+
+  it("redacts legacy agent activity log secrets on read", () => {
+    const task = createTask({ projectId: "proj-1", title: "Legacy log", description: "D" });
+
+    testDb.current
+      .update(tasks)
+      .set({
+        agentActivityLog:
+          "[2026-04-17] Agent: Bearer SECRET\n[2026-04-17] Agent: sk-SECRET\n[2026-04-17] Agent: https://internal.local",
+      })
+      .where(eq(tasks.id, task!.id))
+      .run();
+
+    const resolved = toTaskResponse(findTaskById(task!.id)!);
+
+    expect(resolved.agentActivityLog).toContain("[REDACTED]");
+    expect(resolved.agentActivityLog).not.toContain("SECRET");
+    expect(resolved.agentActivityLog).not.toContain("internal.local");
+  });
+
+  it("applies proactive runtime gate block only when the CAS guard matches", () => {
+    const task = createTask({ projectId: "proj-1", title: "CAS", description: "D" });
+    const snapshot = makeLimitSnapshot();
+
+    testDb.current
+      .update(tasks)
+      .set({ lastHeartbeatAt: null })
+      .where(eq(tasks.id, task!.id))
+      .run();
+
+    const applied = blockTaskForRuntimeGateIfEligible({
+      taskId: task!.id,
+      expectedStatus: "backlog",
+      blockedFromStatus: "backlog",
+      blockedReason: "Coordinator pre-start runtime gate",
+      retryAfter: "2026-04-17T12:00:00.000Z",
+      retryCount: 1,
+      snapshot,
+      persistedAt: "2026-04-17T10:10:00.000Z",
+    });
+
+    expect(applied).toBe(true);
+    const blocked = findTaskById(task!.id)!;
+    expect(blocked.status).toBe("blocked_external");
+    expect(blocked.blockedReason).toBe("Coordinator pre-start runtime gate");
+    expect(blocked.lastHeartbeatAt).toBeNull();
+
+    const secondApply = blockTaskForRuntimeGateIfEligible({
+      taskId: task!.id,
+      expectedStatus: "backlog",
+      blockedFromStatus: "backlog",
+      blockedReason: "Coordinator pre-start runtime gate",
+      retryAfter: "2026-04-17T13:00:00.000Z",
+      retryCount: 2,
+      snapshot,
+      persistedAt: "2026-04-17T10:11:00.000Z",
+    });
+
+    expect(secondApply).toBe(false);
+  });
+
+  it("rejects proactive runtime gate block when autoMode no longer matches the candidate", () => {
+    const task = createTask({
+      projectId: "proj-1",
+      title: "CAS auto",
+      description: "D",
+      autoMode: true,
+    });
+    const snapshot = makeLimitSnapshot();
+
+    testDb.current
+      .update(tasks)
+      .set({ status: "plan_ready", autoMode: false })
+      .where(eq(tasks.id, task!.id))
+      .run();
+
+    const applied = blockTaskForRuntimeGateIfEligible({
+      taskId: task!.id,
+      expectedProjectId: "proj-1",
+      expectedStatus: "plan_ready",
+      expectedAutoMode: true,
+      blockedFromStatus: "plan_ready",
+      blockedReason: "Coordinator pre-start runtime gate",
+      retryAfter: "2026-04-17T12:00:00.000Z",
+      retryCount: 1,
+      snapshot,
+      persistedAt: "2026-04-17T10:10:00.000Z",
+    });
+
+    expect(applied).toBe(false);
+    expect(findTaskById(task!.id)?.status).toBe("plan_ready");
+  });
+
+  it("persists singleton app-wide runtime defaults", () => {
+    const globalProfile = createRuntimeProfile({
+      projectId: null,
+      name: "Global Default",
+      runtimeId: "codex",
+      providerId: "openai",
+      enabled: true,
+    });
+
+    const getAppSettings = dataModuleWithAppSettings.getAppSettings;
+    const updateAppSettings = dataModuleWithAppSettings.updateAppSettings;
+
+    expect(getAppSettings).toBeTypeOf("function");
+    expect(updateAppSettings).toBeTypeOf("function");
+    if (!getAppSettings || !updateAppSettings) return;
+
+    expect(getAppSettings()).toMatchObject({
+      id: 1,
+      defaultTaskRuntimeProfileId: null,
+      defaultPlanRuntimeProfileId: null,
+      defaultReviewRuntimeProfileId: null,
+      defaultChatRuntimeProfileId: null,
+    });
+
+    const updated = updateAppSettings({
+      defaultTaskRuntimeProfileId: globalProfile!.id,
+      defaultPlanRuntimeProfileId: globalProfile!.id,
+      defaultReviewRuntimeProfileId: globalProfile!.id,
+      defaultChatRuntimeProfileId: globalProfile!.id,
+    });
+
+    expect(updated).toMatchObject({
+      id: 1,
+      defaultTaskRuntimeProfileId: globalProfile!.id,
+      defaultPlanRuntimeProfileId: globalProfile!.id,
+      defaultReviewRuntimeProfileId: globalProfile!.id,
+      defaultChatRuntimeProfileId: globalProfile!.id,
+    });
+    expect(getAppSettings()).toMatchObject({
+      id: 1,
+      defaultTaskRuntimeProfileId: globalProfile!.id,
+      defaultPlanRuntimeProfileId: globalProfile!.id,
+      defaultReviewRuntimeProfileId: globalProfile!.id,
+      defaultChatRuntimeProfileId: globalProfile!.id,
+    });
+  });
+
+  it("reads fresh app settings after direct app_settings writes", () => {
+    const globalProfile = createRuntimeProfile({
+      projectId: null,
+      name: "Global Default",
+      runtimeId: "codex",
+      providerId: "openai",
+      enabled: true,
+    });
+
+    const getAppSettings = dataModuleWithAppSettings.getAppSettings;
+
+    expect(getAppSettings).toBeTypeOf("function");
+    if (!getAppSettings) return;
+
+    expect(getAppSettings()).toMatchObject({
+      id: 1,
+      defaultTaskRuntimeProfileId: null,
+    });
+
+    testDb.current
+      .update(appSettings)
+      .set({ defaultTaskRuntimeProfileId: globalProfile!.id })
+      .where(eq(appSettings.id, 1))
+      .run();
+
+    expect(getAppSettings()).toMatchObject({
+      id: 1,
+      defaultTaskRuntimeProfileId: globalProfile!.id,
+    });
+  });
+
+  it("validates runtime profile scope for project visibility and app-default eligibility", () => {
+    seedProject("proj-2");
+    const globalProfile = createRuntimeProfile({
+      projectId: null,
+      name: "Global",
+      runtimeId: "codex",
+      providerId: "openai",
+      enabled: true,
+    });
+    const projectProfile = createRuntimeProfile({
+      projectId: "proj-1",
+      name: "Project",
+      runtimeId: "claude",
+      providerId: "anthropic",
+      enabled: true,
+    });
+    const foreignProjectProfile = createRuntimeProfile({
+      projectId: "proj-2",
+      name: "Foreign",
+      runtimeId: "claude",
+      providerId: "anthropic",
+      enabled: true,
+    });
+    const disabledGlobalProfile = createRuntimeProfile({
+      projectId: null,
+      name: "Disabled Global",
+      runtimeId: "codex",
+      providerId: "openai",
+      enabled: false,
+    });
+
+    const isRuntimeProfileVisibleToProject =
+      dataModuleWithAppSettings.isRuntimeProfileVisibleToProject;
+    const isRuntimeProfileEligibleForAppDefaults =
+      dataModuleWithAppSettings.isRuntimeProfileEligibleForAppDefaults;
+
+    expect(isRuntimeProfileVisibleToProject).toBeTypeOf("function");
+    expect(isRuntimeProfileEligibleForAppDefaults).toBeTypeOf("function");
+    if (!isRuntimeProfileVisibleToProject || !isRuntimeProfileEligibleForAppDefaults) return;
+
+    expect(
+      isRuntimeProfileVisibleToProject({
+        projectId: "proj-1",
+        runtimeProfileId: globalProfile!.id,
+      }),
+    ).toBe(true);
+    expect(
+      isRuntimeProfileVisibleToProject({
+        projectId: "proj-1",
+        runtimeProfileId: projectProfile!.id,
+      }),
+    ).toBe(true);
+    expect(
+      isRuntimeProfileVisibleToProject({
+        projectId: "proj-1",
+        runtimeProfileId: foreignProjectProfile!.id,
+      }),
+    ).toBe(false);
+
+    expect(isRuntimeProfileEligibleForAppDefaults(globalProfile!.id)).toBe(true);
+    expect(isRuntimeProfileEligibleForAppDefaults(projectProfile!.id)).toBe(false);
+    expect(isRuntimeProfileEligibleForAppDefaults(disabledGlobalProfile!.id)).toBe(false);
+  });
+
+  it("resolves app default runtime ids with plan and review fallback to task", () => {
+    const globalTaskProfile = createRuntimeProfile({
+      projectId: null,
+      name: "Global Task",
+      runtimeId: "claude",
+      providerId: "anthropic",
+      enabled: true,
+    });
+    const globalChatProfile = createRuntimeProfile({
+      projectId: null,
+      name: "Global Chat",
+      runtimeId: "codex",
+      providerId: "openai",
+      enabled: true,
+    });
+
+    const updateAppSettings = dataModuleWithAppSettings.updateAppSettings;
+    const getAppDefaultRuntimeProfileId = dataModuleWithAppSettings.getAppDefaultRuntimeProfileId;
+
+    expect(updateAppSettings).toBeTypeOf("function");
+    expect(getAppDefaultRuntimeProfileId).toBeTypeOf("function");
+    if (!updateAppSettings || !getAppDefaultRuntimeProfileId) return;
+
+    updateAppSettings({
+      defaultTaskRuntimeProfileId: globalTaskProfile!.id,
+      defaultPlanRuntimeProfileId: null,
+      defaultReviewRuntimeProfileId: null,
+      defaultChatRuntimeProfileId: globalChatProfile!.id,
+    });
+
+    expect(getAppDefaultRuntimeProfileId("task")).toBe(globalTaskProfile!.id);
+    expect(getAppDefaultRuntimeProfileId("plan")).toBe(globalTaskProfile!.id);
+    expect(getAppDefaultRuntimeProfileId("review")).toBe(globalTaskProfile!.id);
+    expect(getAppDefaultRuntimeProfileId("chat")).toBe(globalChatProfile!.id);
+  });
+
+  it("skips unavailable app defaults and keeps task fallback for plan/review", () => {
+    const globalTaskProfile = createRuntimeProfile({
+      projectId: null,
+      name: "Global Task",
+      runtimeId: "claude",
+      providerId: "anthropic",
+      enabled: true,
+    });
+    const disabledPlanProfile = createRuntimeProfile({
+      projectId: null,
+      name: "Disabled Plan",
+      runtimeId: "codex",
+      providerId: "openai",
+      enabled: false,
+    });
+    const disabledReviewProfile = createRuntimeProfile({
+      projectId: null,
+      name: "Disabled Review",
+      runtimeId: "codex",
+      providerId: "openai",
+      enabled: false,
+    });
+    const disabledChatProfile = createRuntimeProfile({
+      projectId: null,
+      name: "Disabled Chat",
+      runtimeId: "codex",
+      providerId: "openai",
+      enabled: false,
+    });
+
+    const updateAppSettings = dataModuleWithAppSettings.updateAppSettings;
+    const getAppDefaultRuntimeProfileId = dataModuleWithAppSettings.getAppDefaultRuntimeProfileId;
+
+    expect(updateAppSettings).toBeTypeOf("function");
+    expect(getAppDefaultRuntimeProfileId).toBeTypeOf("function");
+    if (!updateAppSettings || !getAppDefaultRuntimeProfileId) return;
+
+    updateAppSettings({
+      defaultTaskRuntimeProfileId: globalTaskProfile!.id,
+      defaultPlanRuntimeProfileId: disabledPlanProfile!.id,
+      defaultReviewRuntimeProfileId: disabledReviewProfile!.id,
+      defaultChatRuntimeProfileId: disabledChatProfile!.id,
+    });
+
+    expect(getAppDefaultRuntimeProfileId("task")).toBe(globalTaskProfile!.id);
+    expect(getAppDefaultRuntimeProfileId("plan")).toBe(globalTaskProfile!.id);
+    expect(getAppDefaultRuntimeProfileId("review")).toBe(globalTaskProfile!.id);
+    expect(getAppDefaultRuntimeProfileId("chat")).toBeNull();
+  });
+
+  it("invalidates cached app settings after runtime profile deletion trigger clears defaults", () => {
+    const globalProfile = createRuntimeProfile({
+      projectId: null,
+      name: "Global Default",
+      runtimeId: "codex",
+      providerId: "openai",
+      enabled: true,
+    });
+
+    const getAppSettings = dataModuleWithAppSettings.getAppSettings;
+    const updateAppSettings = dataModuleWithAppSettings.updateAppSettings;
+
+    expect(getAppSettings).toBeTypeOf("function");
+    expect(updateAppSettings).toBeTypeOf("function");
+    if (!getAppSettings || !updateAppSettings) return;
+
+    updateAppSettings({
+      defaultTaskRuntimeProfileId: globalProfile!.id,
+      defaultPlanRuntimeProfileId: globalProfile!.id,
+      defaultReviewRuntimeProfileId: globalProfile!.id,
+      defaultChatRuntimeProfileId: globalProfile!.id,
+    });
+
+    expect(getAppSettings()).toMatchObject({
+      defaultTaskRuntimeProfileId: globalProfile!.id,
+      defaultPlanRuntimeProfileId: globalProfile!.id,
+      defaultReviewRuntimeProfileId: globalProfile!.id,
+      defaultChatRuntimeProfileId: globalProfile!.id,
+    });
+
+    deleteRuntimeProfile(globalProfile!.id);
+
+    expect(getAppSettings()).toMatchObject({
+      defaultTaskRuntimeProfileId: null,
+      defaultPlanRuntimeProfileId: null,
+      defaultReviewRuntimeProfileId: null,
+      defaultChatRuntimeProfileId: null,
+    });
+  });
+
+  it("lists Codex limit-head overlays with project scope preferred over global", () => {
+    upsertCodexLimitHeads([
+      {
+        accountFingerprint: "acct-1",
+        projectRoot: null,
+        limitId: "codex",
+        snapshot: {
+          ...makeLimitSnapshot(),
+          runtimeId: "codex",
+          providerId: "openai",
+          checkedAt: "2026-04-23T10:00:00.000Z",
+        },
+        observedAt: "2026-04-23T10:00:00.000Z",
+      },
+      {
+        accountFingerprint: "acct-1",
+        projectRoot: "/tmp/test",
+        limitId: "codex",
+        snapshot: {
+          ...makeLimitSnapshot(),
+          runtimeId: "codex",
+          providerId: "openai",
+          checkedAt: "2026-04-23T12:00:00.000Z",
+        },
+        observedAt: "2026-04-23T12:00:00.000Z",
+      },
+    ]);
+
+    const rows = listCodexLimitHeadsForOverlay({
+      accountFingerprint: "acct-1",
+      projectRoot: "/tmp/test",
+      includeGlobalFallback: true,
+      limitId: "codex",
+      limit: 5,
+    });
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0].projectRoot).toBe("/tmp/test");
+    expect(rows[1].projectRoot).toBeNull();
+    expect(rows[0].snapshot?.providerId).toBe("openai");
+  });
+
+  it("normalizes Codex project roots for limit-head overlay lookups", () => {
+    upsertCodexLimitHeads([
+      {
+        accountFingerprint: "acct-normalized",
+        projectRoot: "C:\\Projects\\AIF\\",
+        limitId: "codex",
+        snapshot: {
+          ...makeLimitSnapshot(),
+          runtimeId: "codex",
+          providerId: "openai",
+          checkedAt: "2026-04-23T12:00:00.000Z",
+        },
+        observedAt: "2026-04-23T12:00:00.000Z",
+      },
+    ]);
+
+    const rows = listCodexLimitHeadsForOverlay({
+      accountFingerprint: "acct-normalized",
+      projectRoot: "c:/projects/aif",
+      includeGlobalFallback: false,
+      limitId: "codex",
+      limit: 5,
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].projectRoot).toBe("c:/projects/aif");
+  });
+
+  it("finds preferred Codex overlay head and supports disabling global fallback", () => {
+    upsertCodexLimitHeads([
+      {
+        accountFingerprint: "acct-2",
+        projectRoot: null,
+        limitId: "codex",
+        snapshot: {
+          ...makeLimitSnapshot(),
+          runtimeId: "codex",
+          providerId: "openai",
+          checkedAt: "2026-04-23T09:00:00.000Z",
+        },
+        observedAt: "2026-04-23T09:00:00.000Z",
+      },
+      {
+        accountFingerprint: "acct-2",
+        projectRoot: "/tmp/test",
+        limitId: "codex",
+        snapshot: {
+          ...makeLimitSnapshot(),
+          runtimeId: "codex",
+          providerId: "openai",
+          checkedAt: "2026-04-23T11:00:00.000Z",
+        },
+        observedAt: "2026-04-23T11:00:00.000Z",
+      },
+    ]);
+
+    const preferred = findPreferredCodexLimitHeadForOverlay({
+      accountFingerprint: "acct-2",
+      projectRoot: "/tmp/test",
+      includeGlobalFallback: true,
+      limitId: "codex",
+    });
+    expect(preferred).not.toBeNull();
+    expect(preferred?.projectRoot).toBe("/tmp/test");
+
+    const strictRows = listCodexLimitHeadsForOverlay({
+      accountFingerprint: "acct-2",
+      projectRoot: "/tmp/test",
+      includeGlobalFallback: false,
+      limitId: "codex",
+    });
+    expect(strictRows).toHaveLength(1);
+    expect(strictRows[0].projectRoot).toBe("/tmp/test");
   });
 
   it("resolves task override first", () => {
@@ -266,10 +1234,17 @@ describe("runtime profiles data layer", () => {
       rootPath: "/tmp/with-defaults",
       defaultTaskRuntimeProfileId: profile!.id,
       defaultChatRuntimeProfileId: profile!.id,
+      defaultPlanRuntimeProfileId: profile!.id,
+      defaultReviewRuntimeProfileId: profile!.id,
+    } as Parameters<typeof createProject>[0] & {
+      defaultPlanRuntimeProfileId: string;
+      defaultReviewRuntimeProfileId: string;
     });
 
     const found = findProjectById(project!.id);
     expect(found?.defaultTaskRuntimeProfileId).toBe(profile!.id);
+    expect(found?.defaultPlanRuntimeProfileId).toBe(profile!.id);
+    expect(found?.defaultReviewRuntimeProfileId).toBe(profile!.id);
     expect(found?.defaultChatRuntimeProfileId).toBe(profile!.id);
   });
 });

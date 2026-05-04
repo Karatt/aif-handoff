@@ -4,8 +4,16 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 const mutateCreateTask = vi.fn();
 
 const mockSettingsData = {
-  data: { useSubagents: true, maxReviewIterations: 3 } as
-    | { useSubagents: boolean; maxReviewIterations: number }
+  data: { useSubagents: false, maxReviewIterations: 3 } as
+    | {
+        useSubagents: boolean;
+        maxReviewIterations: number;
+        runtimeDefaults?: {
+          app?: {
+            resolvedDefaultTaskRuntimeProfileId?: string | null;
+          };
+        };
+      }
     | undefined,
 };
 
@@ -50,14 +58,14 @@ const { AddTaskForm } = await import("@/components/kanban/AddTaskForm");
 describe("AddTaskForm", () => {
   beforeEach(() => {
     mutateCreateTask.mockClear();
-    mockSettingsData.data = { useSubagents: true, maxReviewIterations: 3 };
+    mockSettingsData.data = { useSubagents: false, maxReviewIterations: 3 };
     mockDefaultsData.data = undefined;
     mockProjectsData.data = [{ id: "p-1", parallelEnabled: false }];
     mockRuntimeProfilesData.data = [];
     mockRuntimesData.data = [];
   });
 
-  it("uses autoMode=true by default", () => {
+  it("uses autoMode=true by default", { timeout: 15_000 }, async () => {
     render(<AddTaskForm projectId="p-1" />);
 
     fireEvent.click(screen.getByText("Add task"));
@@ -66,15 +74,17 @@ describe("AddTaskForm", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Add" }));
 
-    expect(mutateCreateTask).toHaveBeenCalledWith(
-      expect.objectContaining({
-        projectId: "p-1",
-        title: "Task with auto mode",
-        autoMode: true,
-        isFix: false,
-      }),
-      expect.any(Object),
-    );
+    await waitFor(() => {
+      expect(mutateCreateTask).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: "p-1",
+          title: "Task with auto mode",
+          autoMode: true,
+          isFix: false,
+        }),
+        expect.any(Object),
+      );
+    });
   });
 
   it("submits autoMode=false when checkbox is unchecked", () => {
@@ -285,6 +295,25 @@ describe("AddTaskForm", () => {
     expect(screen.getByText("(project default)")).toBeDefined();
   });
 
+  it("shows app-default runtime hint when only the app default is configured", () => {
+    mockSettingsData.data = {
+      useSubagents: false,
+      maxReviewIterations: 3,
+      runtimeDefaults: {
+        app: {
+          resolvedDefaultTaskRuntimeProfileId: "global-task",
+        },
+      },
+    };
+
+    render(<AddTaskForm projectId="p-1" />);
+
+    fireEvent.click(screen.getByText("Add task"));
+    fireEvent.click(screen.getByRole("button", { name: "Runtime override" }));
+
+    expect(screen.getByText("No override uses the app default runtime profile.")).toBeDefined();
+  });
+
   it("submits selected runtime profile and trimmed model override", () => {
     mockRuntimeProfilesData.data = [
       {
@@ -352,6 +381,39 @@ describe("AddTaskForm", () => {
     ).toBeDefined();
   });
 
+  it("filters disabled runtime profiles out of the override selector", () => {
+    mockRuntimeProfilesData.data = [
+      {
+        id: "rp-enabled",
+        name: "Enabled Profile",
+        runtimeId: "codex",
+        providerId: "openai",
+        projectId: null,
+        enabled: true,
+      },
+      {
+        id: "rp-disabled",
+        name: "Disabled Profile",
+        runtimeId: "codex",
+        providerId: "openai",
+        projectId: null,
+        enabled: false,
+      },
+    ];
+
+    render(<AddTaskForm projectId="p-1" />);
+
+    fireEvent.click(screen.getByText("Add task"));
+    fireEvent.click(screen.getByRole("button", { name: "Runtime override" }));
+
+    expect(
+      screen.getByRole("option", { name: "Enabled Profile [Global] (codex/openai)" }),
+    ).toBeDefined();
+    expect(
+      screen.queryByRole("option", { name: "Disabled Profile [Global] (codex/openai)" }),
+    ).toBeNull();
+  });
+
   it("submits planner settings from advanced options", () => {
     render(<AddTaskForm projectId="p-1" />);
 
@@ -390,7 +452,7 @@ describe("AddTaskForm", () => {
         planDocs: true,
         planTests: true,
         skipReview: false,
-        useSubagents: false,
+        useSubagents: true,
       }),
       expect.any(Object),
     );

@@ -81,6 +81,25 @@ Effective task profile selection order is:
 
 The same pattern applies to chat mode using `default_chat_runtime_profile_id`.
 
+### Runtime-Limit Snapshots and Auto-Pause
+
+Runtime-limit state is normalized once in `@aif/runtime` and then persisted in SQLite so every process sees the same view:
+
+- adapters translate provider-specific quota signals into a shared `runtimeLimitSnapshot` contract;
+- `runtime_profiles.runtime_limit_snapshot_json` stores the latest authoritative profile-level state;
+- `tasks.runtime_limit_snapshot_json` stores a task-level copy when work is blocked by quota pressure or hard exhaustion.
+- API runs a background Codex indexer that reconciles `~/.codex/sessions` into SQLite read-model tables (`codex_sessions`, `codex_limit_heads`, `codex_limit_history`, `codex_index_cursors`) so hot endpoints (`/chat/sessions`, `/runtime-profiles`) use DB reads instead of request-path filesystem scans.
+
+The source is explicit in the snapshot (`provider_api`, `sdk_event`, `api_headers`, `turn_usage`) so upper layers do not need adapter-specific branching.
+
+The coordinator treats persisted profile state as authoritative:
+
+- exact snapshots can proactively gate new work when the configured safety threshold has already been crossed;
+- heuristic snapshots can proactively gate new work when the provider says the runtime is blocked;
+- blocked tasks resume through the existing `blocked_external` + `retryAfter` release path when the provider reset time arrives.
+
+Short-lived in-memory caches exist only for dedupe/throttling repeated identical writes; they are not the source of truth.
+
 ## Agent Pipeline
 
 The coordinator (`packages/agent/src/coordinator.ts`) uses a dual-trigger model: it polls via `node-cron` every 30 seconds as a fallback and also reacts to real-time events from the API WebSocket (task creation, moves, and explicit `agent:wake` signals). Duplicate wakes are debounced. If the WebSocket is unavailable, the coordinator falls back to polling-only mode.
@@ -109,11 +128,12 @@ Backlog ──[start_ai]──► Planning ──► Plan Ready ──► Implem
 
 ### Reliability Guards
 
-The pipeline includes three reliability layers for long-running autonomous execution:
+The pipeline includes four reliability layers for long-running autonomous execution:
 
 - **First-activity watchdog (SDK only):** After agent start, if no tool call or subagent spawn arrives within `AGENT_FIRST_ACTIVITY_TIMEOUT_MS` (default 60s), the agent is killed and restarted (up to 2 retries). Detects hung agents within seconds instead of waiting for the stale timeout. Disabled for CLI/API transports which do not stream tool events.
 - **Heartbeat liveness:** Task rows are updated with `lastHeartbeatAt` during agent activity and stage transitions.
 - **Stale-stage watchdog:** On each poll cycle, tasks stuck in `planning` / `implementing` / `review` beyond timeout are auto-recovered to `blocked_external` with retry backoff.
+- **Runtime-limit auto-pause:** Exact/heuristic persisted runtime-limit snapshots can proactively move new work to `blocked_external` before a provider hard-fails, and structured `resetAt` / `retryAfterSeconds` replace random quota backoff when available.
 - **Transition reset:** valid transitions clear watchdog state (`blocked*`, `retryAfter`, `retryCount`) and refresh heartbeat baseline.
 
 For stale `implementing`, recovery resumes from `plan_ready` to force a clean implementation pass instead of continuing a potentially inconsistent in-flight run.
@@ -196,11 +216,20 @@ fills the pipeline up to a **pool depth**:
   window for early advance.
 - **Parallel project** (`parallelEnabled = true`): pool depth =
   `COORDINATOR_MAX_CONCURRENT_TASKS`. Auto-queue keeps that many tasks in
-  flight, advancing as soon as room frees up.
+  flight, advancing as soon as room frees up. For projects with
+  `git.create_branches=true`, this parallel branch-isolated path is available
+  only when `AIF_TASK_WORKTREES_ENABLED=true`; otherwise the project remains
+  serial and the API rejects parallel auto-queue for that combination.
+  When enabled, full-mode planning creates a sibling git worktree, stores its
+  absolute path in `tasks.worktree_path`, and downstream stages run from that
+  path. Legacy branch-bound tasks without `worktreePath` still force serial
+  execution until they leave the pipeline.
 
 The advance step:
 
-1. Compute `limit = parallelEnabled ? COORDINATOR_MAX_CONCURRENT_TASKS : 1`.
+1. Compute `limit = parallelEnabled ? COORDINATOR_MAX_CONCURRENT_TASKS : 1`,
+   then collapse it to `1` when branch isolation would use the shared project
+   root.
 2. Read `active = countActivePipelineTasksForProject(project)` — counts tasks
    in `planning`, `plan_ready`, `implementing`, `review`, or `blocked_external`.
    Backlog (source) and `done`/`verified` (terminal) do not count.
@@ -210,6 +239,10 @@ The advance step:
    `project:auto_queue_advanced` with the new task id.
 4. The fill loop runs in a single tick so a parallel project can start its
    full pool without waiting for additional poll cycles.
+
+Task worktrees are retained after `done` / `verified` so operators can inspect
+or commit follow-up changes. Handoff records the path but does not automatically
+remove the sibling worktree directory.
 
 Auto-queue and scheduled execution compose in the same poll cycle:
 `processDueScheduledTasks()` runs first and fires every backlog task whose
@@ -243,13 +276,14 @@ The system supports bulk task creation from a project's `.ai-factory/ROADMAP.md`
 
 The API broadcasts events via WebSocket (`/ws` endpoint) on every state change:
 
-| Event          | Trigger                               |
-| -------------- | ------------------------------------- |
-| `task:created` | New task created                      |
-| `task:updated` | Task fields updated                   |
-| `task:moved`   | Task status changed via state machine |
-| `task:deleted` | Task deleted                          |
-| `agent:wake`   | Coordinator should check for work     |
+| Event                           | Trigger                                             |
+| ------------------------------- | --------------------------------------------------- |
+| `task:created`                  | New task created                                    |
+| `task:updated`                  | Task fields updated                                 |
+| `task:moved`                    | Task status changed via state machine               |
+| `task:deleted`                  | Task deleted                                        |
+| `agent:wake`                    | Coordinator should check for work                   |
+| `project:runtime_limit_updated` | Runtime-profile limit snapshot persisted or cleared |
 
 The web UI connects via `useWebSocket` hook and invalidates React Query caches on incoming events. The agent coordinator also subscribes to this WebSocket to receive wake signals for immediate task processing (see Agent Pipeline above).
 
@@ -266,10 +300,13 @@ SQLite via `better-sqlite3` with `drizzle-orm` for type-safe queries. Schema is 
 
 Key tables:
 
-- **tasks** — task data, status, plan/logs, heartbeat metadata, runtime override fields (`runtime_profile_id`, `model_override`, `runtime_options_json`), runtime session id (`session_id`), and auto-review convergence state (`manual_review_required`, `auto_review_state_json`)
-- **runtime_profiles** — project-scoped or global runtime/provider profiles with non-secret transport/model config
+- **tasks** — task data, status, plan/logs, heartbeat metadata, runtime override fields (`runtime_profile_id`, `model_override`, `runtime_options_json`), runtime session id (`session_id`), auto-review convergence state (`manual_review_required`, `auto_review_state_json`), and task-level runtime-limit copy (`runtime_limit_snapshot_json`, `runtime_limit_updated_at`)
+- **runtime_profiles** — project-scoped or global runtime/provider profiles with non-secret transport/model config plus authoritative runtime-limit state (`runtime_limit_snapshot_json`, `runtime_limit_updated_at`)
 - **projects** — project metadata plus default runtime profile ids for tasks and chat
 - **chat_sessions / chat_messages** — persisted chat state with runtime profile/session linkage
+- **codex_sessions** — indexed Codex session metadata keyed by runtime session id and source file state
+- **codex_limit_heads / codex_limit_history** — latest and recent normalized Codex limit snapshots keyed by account fingerprint/project scope/limit id
+- **codex_index_cursors** — per-indexer progress/watermark state for incremental reconcile
 - **task_comments** — human/agent comments with optional attachments
 
 ### Indexes
@@ -283,6 +320,9 @@ Runtime index bootstrap creates the following indexes via `CREATE INDEX IF NOT E
 - `idx_tasks_project_status` — composite for ordered task-list queries
 - `idx_task_comments_task_id` — comment lookups by task
 - `idx_tasks_locked` — parallel execution: find unlocked or stale-locked tasks
+- `idx_codex_sessions_project_root_updated` / `idx_codex_sessions_file_path` — local Codex session listing and session-id/file-path lookup
+- `idx_codex_limit_heads_lookup` — account/project/limit scoped head overlay queries
+- `idx_codex_limit_history_head` / `idx_codex_limit_history_account` — bounded recent limit history by head and account scope
 
 ## See Also
 

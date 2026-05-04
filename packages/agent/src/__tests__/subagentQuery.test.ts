@@ -1,16 +1,45 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const queryMock = vi.fn();
 const logActivityMock = vi.fn();
 const incrementTaskTokenUsageMock = vi.fn();
+const persistRuntimeProfileLimitSnapshotMock = vi.fn();
+const clearRuntimeProfileLimitSnapshotMock = vi.fn();
+const notifyProjectRuntimeLimitBroadcastMock = vi.fn();
 const saveTaskSessionIdMock = vi.fn();
-const getTaskSessionIdMock = vi.fn(() => null);
+const getTaskSessionIdMock = vi.fn<(taskId: string) => string | null>(() => null);
+const expireStaleRuntimeWarmupSessionsMock = vi.fn(() => 0);
+const findActiveReadyRuntimeWarmupSessionMock = vi.fn<
+  () =>
+    | {
+        id: string;
+        projectId: string;
+        runtimeProfileId: string | null;
+        runtimeId: string;
+        providerId: string;
+        transport: string;
+        model: string | null;
+        sourceSessionId: string;
+        status: string;
+        ttlSeconds: number;
+        expiresAt: string;
+        summary: string | null;
+        errorMessage: string | null;
+        createdAt: string;
+        updatedAt: string;
+      }
+    | undefined
+>(() => undefined);
+const getAppDefaultRuntimeProfileIdMock = vi.fn<
+  (mode: "task" | "plan" | "review" | "chat") => string | null
+>(() => null);
 
 interface MockTaskRow {
   id: string;
   projectId: string;
   runtimeOptionsJson: string | null;
   modelOverride: string | null;
+  branchName?: string | null;
 }
 
 interface MockEffectiveRuntimeProfile {
@@ -55,11 +84,16 @@ vi.mock("@aif/data", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@aif/data")>();
   return {
     ...actual,
+    clearRuntimeProfileLimitSnapshot: clearRuntimeProfileLimitSnapshotMock,
     incrementTaskTokenUsage: incrementTaskTokenUsageMock,
     updateTaskHeartbeat: vi.fn(),
     renewTaskClaim: vi.fn(),
+    persistRuntimeProfileLimitSnapshot: persistRuntimeProfileLimitSnapshotMock,
     saveTaskSessionId: saveTaskSessionIdMock,
     getTaskSessionId: getTaskSessionIdMock,
+    expireStaleRuntimeWarmupSessions: expireStaleRuntimeWarmupSessionsMock,
+    findActiveReadyRuntimeWarmupSession: findActiveReadyRuntimeWarmupSessionMock,
+    getAppDefaultRuntimeProfileId: getAppDefaultRuntimeProfileIdMock,
     findTaskById: findTaskByIdMock,
     resolveEffectiveRuntimeProfile: resolveEffectiveRuntimeProfileMock,
   };
@@ -98,6 +132,8 @@ const baseMockEnv = {
   AGENT_MAX_REVIEW_ITERATIONS: 3,
   AGENT_USE_SUBAGENTS: true,
   AGENT_FIRST_ACTIVITY_TIMEOUT_MS: 60_000,
+  AIF_USAGE_LIMITS_ENABLED: true,
+  AIF_WARMUP_ENABLED: false,
   TELEGRAM_BOT_TOKEN: undefined,
   TELEGRAM_USER_ID: undefined,
 };
@@ -134,7 +170,20 @@ vi.mock("../stderrCollector.js", () => ({
   }),
 }));
 
-const { executeSubagentQuery } = await import("../subagentQuery.js");
+vi.mock("../notifier.js", () => ({
+  notifyProjectRuntimeLimitBroadcast: (...args: unknown[]) =>
+    notifyProjectRuntimeLimitBroadcastMock(...args),
+}));
+
+const { RuntimeExecutionError } = await import("@aif/runtime");
+const { executeSubagentQuery, resolveAdapterForTask } = await import("../subagentQuery.js");
+
+beforeEach(() => {
+  expireStaleRuntimeWarmupSessionsMock.mockReset();
+  expireStaleRuntimeWarmupSessionsMock.mockReturnValue(0);
+  findActiveReadyRuntimeWarmupSessionMock.mockReset();
+  findActiveReadyRuntimeWarmupSessionMock.mockReturnValue(undefined);
+});
 
 function makeDelayedSuccess(delayMs: number, result: string) {
   return async function* () {
@@ -168,11 +217,22 @@ function makeSuccessWithSession(sessionId: string, result: string) {
 
 describe("executeSubagentQuery attribution", () => {
   beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: vi.fn().mockResolvedValue({}),
+      }),
+    );
     (globalThis as { __AIF_CLAUDE_QUERY_MOCK__?: typeof queryMock }).__AIF_CLAUDE_QUERY_MOCK__ =
       queryMock;
     queryMock.mockReset();
     logActivityMock.mockReset();
     incrementTaskTokenUsageMock.mockReset();
+    persistRuntimeProfileLimitSnapshotMock.mockReset();
+    clearRuntimeProfileLimitSnapshotMock.mockReset();
+    notifyProjectRuntimeLimitBroadcastMock.mockReset();
     saveTaskSessionIdMock.mockReset();
     getTaskSessionIdMock.mockReset();
     findTaskByIdMock.mockReset();
@@ -191,6 +251,10 @@ describe("executeSubagentQuery attribution", () => {
       projectRuntimeProfileId: null,
       systemRuntimeProfileId: null,
     });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("passes empty attribution to suppress Co-Authored-By trailers", async () => {
@@ -217,6 +281,121 @@ describe("executeSubagentQuery attribution", () => {
       expect.objectContaining({ attribution: { commit: "", pr: "" } }),
     );
   });
+
+  it("passes Handoff branch contract in runtime environment", async () => {
+    findTaskByIdMock.mockReturnValue({
+      id: "task-branch",
+      projectId: "project-1",
+      runtimeOptionsJson: null,
+      modelOverride: null,
+      branchName: "feature/task-branch",
+    });
+    queryMock.mockImplementation(async function* () {
+      yield {
+        type: "result",
+        subtype: "success",
+        result: "done",
+        usage: {},
+        total_cost_usd: 0,
+      };
+    });
+
+    await executeSubagentQuery({
+      taskId: "task-branch",
+      projectRoot: "/tmp/project",
+      agentName: "plan-coordinator",
+      prompt: "run",
+      workflowKind: "planner",
+    });
+
+    const callOptions = queryMock.mock.calls[0][0].options;
+    expect(callOptions.env).toEqual(
+      expect.objectContaining({
+        HANDOFF_MODE: "1",
+        HANDOFF_TASK_ID: "task-branch",
+        HANDOFF_BRANCH_PREPARED: "1",
+        HANDOFF_BRANCH_NAME: "feature/task-branch",
+      }),
+    );
+  });
+});
+
+describe("subagent app-default runtime resolution", () => {
+  beforeEach(() => {
+    (globalThis as { __AIF_CLAUDE_QUERY_MOCK__?: typeof queryMock }).__AIF_CLAUDE_QUERY_MOCK__ =
+      queryMock;
+    queryMock.mockReset();
+    logActivityMock.mockReset();
+    incrementTaskTokenUsageMock.mockReset();
+    saveTaskSessionIdMock.mockReset();
+    getTaskSessionIdMock.mockReset();
+    getAppDefaultRuntimeProfileIdMock.mockReset();
+    findTaskByIdMock.mockReset();
+    resolveEffectiveRuntimeProfileMock.mockReset();
+    getTaskSessionIdMock.mockReturnValue(null);
+    getAppDefaultRuntimeProfileIdMock.mockReturnValue(null);
+    findTaskByIdMock.mockReturnValue({
+      id: "task-1",
+      projectId: "project-1",
+      runtimeOptionsJson: null,
+      modelOverride: null,
+    });
+    resolveEffectiveRuntimeProfileMock.mockReturnValue({
+      source: "none",
+      profile: null,
+      taskRuntimeProfileId: null,
+      projectRuntimeProfileId: null,
+      systemRuntimeProfileId: null,
+    });
+  });
+
+  it("passes app-level review defaults when resolving an adapter for a task", async () => {
+    getAppDefaultRuntimeProfileIdMock.mockReturnValue("app-review-default");
+
+    await resolveAdapterForTask("task-1", "review");
+
+    expect(getAppDefaultRuntimeProfileIdMock).toHaveBeenCalledWith("review");
+    expect(resolveEffectiveRuntimeProfileMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskId: "task-1",
+        projectId: "project-1",
+        mode: "review",
+        systemDefaultRuntimeProfileId: "app-review-default",
+      }),
+    );
+  });
+
+  it("passes app-level plan defaults into subagent execution context resolution", async () => {
+    getAppDefaultRuntimeProfileIdMock.mockReturnValue("app-plan-default");
+    queryMock.mockImplementation(async function* () {
+      yield {
+        type: "result",
+        subtype: "success",
+        result: "done",
+        usage: {},
+        total_cost_usd: 0,
+      };
+    });
+
+    await executeSubagentQuery({
+      taskId: "task-1",
+      projectRoot: "/tmp/project",
+      agentName: "plan-coordinator",
+      prompt: "run",
+      profileMode: "plan",
+      workflowKind: "planner",
+    });
+
+    expect(getAppDefaultRuntimeProfileIdMock).toHaveBeenCalledWith("plan");
+    expect(resolveEffectiveRuntimeProfileMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskId: "task-1",
+        projectId: "project-1",
+        mode: "plan",
+        systemDefaultRuntimeProfileId: "app-plan-default",
+      }),
+    );
+  });
 });
 
 describe("executeSubagentQuery query_start_timeout retry", () => {
@@ -231,11 +410,22 @@ describe("executeSubagentQuery query_start_timeout retry", () => {
   };
 
   beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: vi.fn().mockResolvedValue({}),
+      }),
+    );
     (globalThis as { __AIF_CLAUDE_QUERY_MOCK__?: typeof queryMock }).__AIF_CLAUDE_QUERY_MOCK__ =
       queryMock;
     queryMock.mockReset();
     logActivityMock.mockReset();
     incrementTaskTokenUsageMock.mockReset();
+    persistRuntimeProfileLimitSnapshotMock.mockReset();
+    clearRuntimeProfileLimitSnapshotMock.mockReset();
+    notifyProjectRuntimeLimitBroadcastMock.mockReset();
     saveTaskSessionIdMock.mockReset();
     getTaskSessionIdMock.mockReset();
     findTaskByIdMock.mockReset();
@@ -254,6 +444,10 @@ describe("executeSubagentQuery query_start_timeout retry", () => {
       projectRuntimeProfileId: null,
       systemRuntimeProfileId: null,
     });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("retries once after query_start_timeout and succeeds on second attempt", async () => {
@@ -279,11 +473,22 @@ describe("executeSubagentQuery query_start_timeout retry", () => {
 
 describe("executeSubagentQuery session persistence policy", () => {
   beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: vi.fn().mockResolvedValue({}),
+      }),
+    );
     (globalThis as { __AIF_CLAUDE_QUERY_MOCK__?: typeof queryMock }).__AIF_CLAUDE_QUERY_MOCK__ =
       queryMock;
     queryMock.mockReset();
     logActivityMock.mockReset();
     incrementTaskTokenUsageMock.mockReset();
+    persistRuntimeProfileLimitSnapshotMock.mockReset();
+    clearRuntimeProfileLimitSnapshotMock.mockReset();
+    notifyProjectRuntimeLimitBroadcastMock.mockReset();
     saveTaskSessionIdMock.mockReset();
     getTaskSessionIdMock.mockReset();
     findTaskByIdMock.mockReset();
@@ -302,6 +507,10 @@ describe("executeSubagentQuery session persistence policy", () => {
       projectRuntimeProfileId: null,
       systemRuntimeProfileId: null,
     });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("persists runtime session for resume_if_available workflows", async () => {
@@ -339,13 +548,813 @@ describe("executeSubagentQuery session persistence policy", () => {
   });
 });
 
-describe("executeSubagentQuery model fallback policy", () => {
+describe("executeSubagentQuery planner warmup fork", () => {
   beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: vi.fn().mockResolvedValue({}),
+      }),
+    );
+    (globalThis as { __AIF_CLAUDE_QUERY_MOCK__?: typeof queryMock }).__AIF_CLAUDE_QUERY_MOCK__ =
+      queryMock;
+    queryMock.mockReset();
+    logActivityMock.mockReset();
+    saveTaskSessionIdMock.mockReset();
+    getTaskSessionIdMock.mockReset();
+    findTaskByIdMock.mockReset();
+    resolveEffectiveRuntimeProfileMock.mockReset();
+    getTaskSessionIdMock.mockReturnValue(null);
+    findTaskByIdMock.mockReturnValue({
+      id: "task-1",
+      projectId: "project-1",
+      runtimeOptionsJson: null,
+      modelOverride: null,
+    });
+    resolveEffectiveRuntimeProfileMock.mockReturnValue({
+      source: "none",
+      profile: null,
+      taskRuntimeProfileId: null,
+      projectRuntimeProfileId: null,
+      systemRuntimeProfileId: null,
+    });
+    mockEnvOverrides.AIF_WARMUP_ENABLED = true;
+    mockEnvOverrides.AIF_RUNTIME_SESSION_FORK_ENABLED = true;
+  });
+
+  afterEach(() => {
+    delete mockEnvOverrides.AIF_WARMUP_ENABLED;
+    delete mockEnvOverrides.AIF_RUNTIME_SESSION_FORK_ENABLED;
+    vi.unstubAllGlobals();
+  });
+
+  it("forks an active planner warmup and persists the child session id", async () => {
+    findActiveReadyRuntimeWarmupSessionMock.mockReturnValue({
+      id: "warmup-1",
+      projectId: "project-1",
+      runtimeProfileId: null,
+      runtimeId: "claude",
+      providerId: "anthropic",
+      transport: "sdk",
+      model: null,
+      sourceSessionId: "warm-source-session",
+      status: "ready",
+      ttlSeconds: 600,
+      expiresAt: "2026-04-30T12:00:00.000Z",
+      summary: "summary",
+      errorMessage: null,
+      createdAt: "2026-04-30T11:00:00.000Z",
+      updatedAt: "2026-04-30T11:00:00.000Z",
+    });
+    queryMock.mockImplementation(makeSuccessWithSession("planner-child-session", "planned"));
+
+    const result = await executeSubagentQuery({
+      taskId: "task-1",
+      projectRoot: "/tmp/project",
+      agentName: "plan-coordinator",
+      prompt: "plan",
+      workflowKind: "planner",
+    });
+
+    expect(result.resultText).toBe("planned");
+    const callOptions = queryMock.mock.calls[0][0].options;
+    expect(callOptions.resume).toBe("warm-source-session");
+    expect(callOptions.forkSession).toBe(true);
+    expect(saveTaskSessionIdMock).toHaveBeenCalledWith("task-1", "planner-child-session");
+  });
+
+  it("skips warmup when the task already has a persisted session", async () => {
+    getTaskSessionIdMock.mockReturnValue("existing-task-session");
+    queryMock.mockImplementation(makeSuccessWithSession("resumed-session", "done"));
+
+    await executeSubagentQuery({
+      taskId: "task-existing-session",
+      projectRoot: "/tmp/project",
+      agentName: "plan-coordinator",
+      prompt: "plan",
+      workflowKind: "planner",
+    });
+
+    expect(findActiveReadyRuntimeWarmupSessionMock).not.toHaveBeenCalled();
+    const callOptions = queryMock.mock.calls[0][0].options;
+    expect(callOptions.resume).toBe("existing-task-session");
+    expect(callOptions.forkSession).toBeUndefined();
+  });
+
+  it("forks an active implementer warmup and then persists the child session id", async () => {
+    findActiveReadyRuntimeWarmupSessionMock.mockReturnValue({
+      id: "warmup-impl",
+      projectId: "project-1",
+      runtimeProfileId: null,
+      runtimeId: "claude",
+      providerId: "anthropic",
+      transport: "sdk",
+      model: null,
+      sourceSessionId: "warm-impl-source",
+      status: "ready",
+      ttlSeconds: 600,
+      expiresAt: "2026-04-30T12:00:00.000Z",
+      summary: "summary",
+      errorMessage: null,
+      createdAt: "2026-04-30T11:00:00.000Z",
+      updatedAt: "2026-04-30T11:00:00.000Z",
+    });
+    queryMock.mockImplementation(makeSuccessWithSession("impl-child-session", "done"));
+
+    await executeSubagentQuery({
+      taskId: "task-implementer",
+      projectRoot: "/tmp/project",
+      agentName: "implement-coordinator",
+      prompt: "implement",
+      workflowKind: "implementer",
+    });
+
+    expect(findActiveReadyRuntimeWarmupSessionMock).toHaveBeenCalledWith({
+      projectId: "project-1",
+      runtimeProfileId: null,
+      runtimeId: "claude",
+      providerId: "anthropic",
+      transport: "sdk",
+      model: null,
+    });
+    const callOptions = queryMock.mock.calls[0][0].options;
+    expect(callOptions.resume).toBe("warm-impl-source");
+    expect(callOptions.forkSession).toBe(true);
+    expect(saveTaskSessionIdMock).toHaveBeenCalledWith("task-implementer", "impl-child-session");
+  });
+
+  it("uses standard resume for implementer when the task already has a session", async () => {
+    getTaskSessionIdMock.mockReturnValue("existing-impl-session");
+    queryMock.mockImplementation(makeSuccessWithSession("resumed-impl-session", "done"));
+
+    await executeSubagentQuery({
+      taskId: "task-implementer-resume",
+      projectRoot: "/tmp/project",
+      agentName: "implement-coordinator",
+      prompt: "implement",
+      workflowKind: "implementer",
+    });
+
+    expect(findActiveReadyRuntimeWarmupSessionMock).not.toHaveBeenCalled();
+    const callOptions = queryMock.mock.calls[0][0].options;
+    expect(callOptions.resume).toBe("existing-impl-session");
+    expect(callOptions.forkSession).toBeUndefined();
+  });
+
+  it("forks an active review warmup for review-sidecar workflows", async () => {
+    findActiveReadyRuntimeWarmupSessionMock.mockReturnValue({
+      id: "warmup-review",
+      projectId: "project-1",
+      runtimeProfileId: null,
+      runtimeId: "claude",
+      providerId: "anthropic",
+      transport: "sdk",
+      model: null,
+      sourceSessionId: "warm-review-source",
+      status: "ready",
+      ttlSeconds: 600,
+      expiresAt: "2026-04-30T12:00:00.000Z",
+      summary: "summary",
+      errorMessage: null,
+      createdAt: "2026-04-30T11:00:00.000Z",
+      updatedAt: "2026-04-30T11:00:00.000Z",
+    });
+    queryMock.mockImplementation(makeSuccessWithSession("review-child-session", "reviewed"));
+
+    await executeSubagentQuery({
+      taskId: "task-review",
+      projectRoot: "/tmp/project",
+      agentName: "review-sidecar",
+      prompt: "review",
+      workflowKind: "reviewer",
+      profileMode: "review",
+    });
+
+    const callOptions = queryMock.mock.calls[0][0].options;
+    expect(callOptions.resume).toBe("warm-review-source");
+    expect(callOptions.forkSession).toBe(true);
+    expect(saveTaskSessionIdMock).toHaveBeenCalledWith("task-review", "review-child-session");
+  });
+
+  it("forks the reviewer warmup for security review workflows", async () => {
+    findActiveReadyRuntimeWarmupSessionMock.mockReturnValue({
+      id: "warmup-review-security",
+      projectId: "project-1",
+      runtimeProfileId: null,
+      runtimeId: "claude",
+      providerId: "anthropic",
+      transport: "sdk",
+      model: null,
+      sourceSessionId: "warm-review-source",
+      status: "ready",
+      ttlSeconds: 600,
+      expiresAt: "2026-04-30T12:00:00.000Z",
+      summary: "summary",
+      errorMessage: null,
+      createdAt: "2026-04-30T11:00:00.000Z",
+      updatedAt: "2026-04-30T11:00:00.000Z",
+    });
+    queryMock.mockImplementation(makeSuccessWithSession("review-security-child", "reviewed"));
+
+    await executeSubagentQuery({
+      taskId: "task-review-security",
+      projectRoot: "/tmp/project",
+      agentName: "review-security",
+      prompt: "review security",
+      workflowKind: "review-security",
+      profileMode: "review",
+    });
+
+    const callOptions = queryMock.mock.calls[0][0].options;
+    expect(callOptions.resume).toBe("warm-review-source");
+    expect(callOptions.forkSession).toBe(true);
+    expect(saveTaskSessionIdMock).toHaveBeenCalledWith(
+      "task-review-security",
+      "review-security-child",
+    );
+  });
+
+  it("skips warmup for non-stage helper workflows", async () => {
+    queryMock.mockImplementation(makeSuccessWithSession("helper-session", "done"));
+
+    await executeSubagentQuery({
+      taskId: "task-helper",
+      projectRoot: "/tmp/project",
+      agentName: "implement-checklist-sync",
+      prompt: "sync",
+      workflowKind: "implementer_checklist_sync",
+    });
+
+    expect(findActiveReadyRuntimeWarmupSessionMock).not.toHaveBeenCalled();
+    const callOptions = queryMock.mock.calls[0][0].options;
+    expect(callOptions.forkSession).toBeUndefined();
+  });
+
+  it("falls back to cold start when no matching warmup is active", async () => {
+    queryMock.mockImplementation(makeSuccessWithSession("cold-session", "planned"));
+
+    await executeSubagentQuery({
+      taskId: "task-cold",
+      projectRoot: "/tmp/project",
+      agentName: "plan-coordinator",
+      prompt: "plan",
+      workflowKind: "planner",
+    });
+
+    expect(findActiveReadyRuntimeWarmupSessionMock).toHaveBeenCalledWith({
+      projectId: "project-1",
+      runtimeProfileId: null,
+      runtimeId: "claude",
+      providerId: "anthropic",
+      transport: "sdk",
+      model: null,
+    });
+    const callOptions = queryMock.mock.calls[0][0].options;
+    expect(callOptions.resume).toBeUndefined();
+    expect(callOptions.forkSession).toBeUndefined();
+  });
+
+  it("falls back to cold start when stale warmups were expired", async () => {
+    expireStaleRuntimeWarmupSessionsMock.mockReturnValue(1);
+    queryMock.mockImplementation(makeSuccessWithSession("cold-after-expire", "planned"));
+
+    await executeSubagentQuery({
+      taskId: "task-expired",
+      projectRoot: "/tmp/project",
+      agentName: "plan-coordinator",
+      prompt: "plan",
+      workflowKind: "planner",
+    });
+
+    expect(expireStaleRuntimeWarmupSessionsMock).toHaveBeenCalled();
+    const callOptions = queryMock.mock.calls[0][0].options;
+    expect(callOptions.resume).toBeUndefined();
+    expect(callOptions.forkSession).toBeUndefined();
+  });
+});
+
+describe("executeSubagentQuery runtime limit state refresh", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: vi.fn().mockResolvedValue({}),
+      }),
+    );
     (globalThis as { __AIF_CLAUDE_QUERY_MOCK__?: typeof queryMock }).__AIF_CLAUDE_QUERY_MOCK__ =
       queryMock;
     queryMock.mockReset();
     logActivityMock.mockReset();
     incrementTaskTokenUsageMock.mockReset();
+    persistRuntimeProfileLimitSnapshotMock.mockReset();
+    clearRuntimeProfileLimitSnapshotMock.mockReset();
+    notifyProjectRuntimeLimitBroadcastMock.mockReset();
+    saveTaskSessionIdMock.mockReset();
+    delete mockEnvOverrides.AIF_USAGE_LIMITS_ENABLED;
+    getTaskSessionIdMock.mockReset();
+    findTaskByIdMock.mockReset();
+    resolveEffectiveRuntimeProfileMock.mockReset();
+    getTaskSessionIdMock.mockReturnValue(null);
+    findTaskByIdMock.mockReturnValue({
+      id: "task-1",
+      projectId: "project-1",
+      runtimeOptionsJson: null,
+      modelOverride: null,
+    });
+    resolveEffectiveRuntimeProfileMock.mockReturnValue({
+      source: "project_default",
+      profile: {
+        id: "profile-1",
+        runtimeId: "claude",
+        providerId: "anthropic",
+        defaultModel: null,
+      },
+      taskRuntimeProfileId: null,
+      projectRuntimeProfileId: "profile-1",
+      systemRuntimeProfileId: null,
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("persists runtime profile limit snapshots from Claude rate_limit_event", async () => {
+    queryMock.mockImplementation(async function* () {
+      yield {
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "allowed_warning",
+          rateLimitType: "five_hour",
+          utilization: 0.96,
+          resetsAt: 1_776_389_600,
+        },
+      };
+      yield {
+        type: "result",
+        subtype: "success",
+        result: "done",
+        usage: {},
+        total_cost_usd: 0,
+      };
+    });
+
+    await executeSubagentQuery({
+      taskId: "task-limit",
+      projectRoot: "/tmp/project",
+      agentName: "implement-coordinator",
+      prompt: "run",
+      workflowKind: "implementer",
+    });
+
+    expect(persistRuntimeProfileLimitSnapshotMock).toHaveBeenCalledTimes(1);
+    expect(persistRuntimeProfileLimitSnapshotMock).toHaveBeenCalledWith(
+      "profile-1",
+      expect.objectContaining({
+        status: "warning",
+        source: "sdk_event",
+        profileId: "profile-1",
+        runtimeId: "claude",
+        providerId: "anthropic",
+      }),
+      expect.any(String),
+    );
+    expect(clearRuntimeProfileLimitSnapshotMock).not.toHaveBeenCalled();
+    expect(notifyProjectRuntimeLimitBroadcastMock).toHaveBeenCalledWith("project-1", "profile-1", {
+      taskId: "task-limit",
+    });
+  });
+
+  it("does not parse or persist runtime limit snapshots when usage limits are disabled", async () => {
+    mockEnvOverrides.AIF_USAGE_LIMITS_ENABLED = false;
+    queryMock.mockImplementation(async function* () {
+      yield {
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "allowed_warning",
+          rateLimitType: "five_hour",
+          utilization: 0.96,
+          resetsAt: 1_776_389_600,
+        },
+      };
+      yield {
+        type: "result",
+        subtype: "success",
+        result: "done",
+        usage: {},
+        total_cost_usd: 0,
+      };
+    });
+
+    await executeSubagentQuery({
+      taskId: "task-limit-disabled",
+      projectRoot: "/tmp/project",
+      agentName: "implement-coordinator",
+      prompt: "run",
+      workflowKind: "implementer",
+    });
+
+    expect(persistRuntimeProfileLimitSnapshotMock).not.toHaveBeenCalled();
+    expect(clearRuntimeProfileLimitSnapshotMock).not.toHaveBeenCalled();
+    expect(notifyProjectRuntimeLimitBroadcastMock).not.toHaveBeenCalled();
+    delete mockEnvOverrides.AIF_USAGE_LIMITS_ENABLED;
+  });
+
+  it("preserves runtime profile limit state after successful runs without limit metadata", async () => {
+    queryMock.mockImplementation(async function* () {
+      yield {
+        type: "result",
+        subtype: "success",
+        result: "done",
+        usage: {},
+        total_cost_usd: 0,
+      };
+    });
+
+    await executeSubagentQuery({
+      taskId: "task-clear-limit",
+      projectRoot: "/tmp/project",
+      agentName: "implement-coordinator",
+      prompt: "run",
+      workflowKind: "implementer",
+    });
+
+    expect(clearRuntimeProfileLimitSnapshotMock).not.toHaveBeenCalled();
+    expect(persistRuntimeProfileLimitSnapshotMock).not.toHaveBeenCalled();
+    expect(notifyProjectRuntimeLimitBroadcastMock).not.toHaveBeenCalled();
+  });
+
+  it("broadcasts project-scoped runtime updates for each project even when DB dedupe skips identical snapshot write", async () => {
+    notifyProjectRuntimeLimitBroadcastMock.mockResolvedValue(true);
+
+    resolveEffectiveRuntimeProfileMock.mockReturnValue({
+      source: "project_default",
+      profile: {
+        id: "profile-shared-global",
+        runtimeId: "claude",
+        providerId: "anthropic",
+        defaultModel: null,
+      },
+      taskRuntimeProfileId: null,
+      projectRuntimeProfileId: "profile-shared-global",
+      systemRuntimeProfileId: null,
+    });
+
+    const tasksById: Record<string, MockTaskRow> = {
+      "task-project-a": {
+        id: "task-project-a",
+        projectId: "project-A",
+        runtimeOptionsJson: null,
+        modelOverride: null,
+      },
+      "task-project-b": {
+        id: "task-project-b",
+        projectId: "project-B",
+        runtimeOptionsJson: null,
+        modelOverride: null,
+      },
+    };
+    findTaskByIdMock.mockImplementation((taskId: string) => tasksById[taskId]);
+
+    queryMock.mockImplementation(async function* () {
+      yield {
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "allowed_warning",
+          rateLimitType: "five_hour",
+          utilization: 0.96,
+          resetsAt: 1_776_389_600,
+        },
+      };
+      yield {
+        type: "result",
+        subtype: "success",
+        result: "done",
+        usage: {},
+        total_cost_usd: 0,
+      };
+    });
+
+    await executeSubagentQuery({
+      taskId: "task-project-a",
+      projectRoot: "/tmp/project-a",
+      agentName: "implement-coordinator",
+      prompt: "run",
+      workflowKind: "implementer",
+    });
+
+    await executeSubagentQuery({
+      taskId: "task-project-b",
+      projectRoot: "/tmp/project-b",
+      agentName: "implement-coordinator",
+      prompt: "run",
+      workflowKind: "implementer",
+    });
+
+    expect(persistRuntimeProfileLimitSnapshotMock).toHaveBeenCalledTimes(1);
+    expect(notifyProjectRuntimeLimitBroadcastMock).toHaveBeenCalledTimes(2);
+    expect(notifyProjectRuntimeLimitBroadcastMock).toHaveBeenNthCalledWith(
+      1,
+      "project-A",
+      "profile-shared-global",
+      { taskId: "task-project-a" },
+    );
+    expect(notifyProjectRuntimeLimitBroadcastMock).toHaveBeenNthCalledWith(
+      2,
+      "project-B",
+      "profile-shared-global",
+      { taskId: "task-project-b" },
+    );
+  });
+
+  it("coalesces concurrent identical runtime limit broadcasts while the first notify is in flight", async () => {
+    let hasPendingBroadcast = false;
+    let resolveBroadcast: (value: boolean) => void = () => {
+      throw new Error("Expected runtime limit broadcast promise to be pending");
+    };
+    notifyProjectRuntimeLimitBroadcastMock.mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          hasPendingBroadcast = true;
+          resolveBroadcast = resolve;
+        }),
+    );
+
+    queryMock.mockImplementation(async function* () {
+      yield {
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "allowed_warning",
+          rateLimitType: "five_hour",
+          utilization: 0.96,
+          resetsAt: 1_776_389_600,
+        },
+      };
+      yield {
+        type: "result",
+        subtype: "success",
+        result: "done",
+        usage: {},
+        total_cost_usd: 0,
+      };
+    });
+
+    const first = executeSubagentQuery({
+      taskId: "task-1",
+      projectRoot: "/tmp/project",
+      agentName: "implement-coordinator",
+      prompt: "run",
+      workflowKind: "implementer",
+    });
+    const second = executeSubagentQuery({
+      taskId: "task-1",
+      projectRoot: "/tmp/project",
+      agentName: "implement-coordinator",
+      prompt: "run",
+      workflowKind: "implementer",
+    });
+
+    await vi.waitFor(() => {
+      expect(notifyProjectRuntimeLimitBroadcastMock).toHaveBeenCalledTimes(1);
+    });
+
+    expect(hasPendingBroadcast).toBe(true);
+    resolveBroadcast(true);
+    await Promise.all([first, second]);
+  });
+
+  it("keeps a newer broadcast cache signature when an older notify fails later", async () => {
+    const taskId = "task-broadcast-race";
+    let notifyCall = 0;
+    let rejectFirstBroadcast: (error: unknown) => void = () => {
+      throw new Error("Expected first runtime limit broadcast to still be pending");
+    };
+    notifyProjectRuntimeLimitBroadcastMock.mockImplementation(() => {
+      notifyCall += 1;
+      if (notifyCall === 1) {
+        return new Promise<boolean>((_resolve, reject) => {
+          rejectFirstBroadcast = reject;
+        });
+      }
+      return Promise.resolve(true);
+    });
+
+    let queryCall = 0;
+    queryMock.mockImplementation(async function* () {
+      queryCall += 1;
+      const utilization = queryCall === 1 ? 0.96 : 0.91;
+      const resetAt = queryCall === 1 ? 1_776_389_600 : 1_776_393_200;
+
+      yield {
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "allowed_warning",
+          rateLimitType: "five_hour",
+          utilization,
+          resetsAt: resetAt,
+        },
+      };
+      yield {
+        type: "result",
+        subtype: "success",
+        result: "done",
+        usage: {},
+        total_cost_usd: 0,
+      };
+    });
+
+    await executeSubagentQuery({
+      taskId,
+      projectRoot: "/tmp/project",
+      agentName: "implement-coordinator",
+      prompt: "run",
+      workflowKind: "implementer",
+    });
+
+    await vi.waitFor(() => {
+      expect(notifyProjectRuntimeLimitBroadcastMock).toHaveBeenCalledTimes(1);
+    });
+
+    await executeSubagentQuery({
+      taskId,
+      projectRoot: "/tmp/project",
+      agentName: "implement-coordinator",
+      prompt: "run",
+      workflowKind: "implementer",
+    });
+
+    await vi.waitFor(() => {
+      expect(notifyProjectRuntimeLimitBroadcastMock).toHaveBeenCalledTimes(2);
+    });
+
+    rejectFirstBroadcast(new Error("delivery failed"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await executeSubagentQuery({
+      taskId,
+      projectRoot: "/tmp/project",
+      agentName: "implement-coordinator",
+      prompt: "run",
+      workflowKind: "implementer",
+    });
+
+    expect(notifyProjectRuntimeLimitBroadcastMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("executeSubagentQuery error redaction", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: vi.fn().mockResolvedValue({}),
+      }),
+    );
+    (globalThis as { __AIF_CLAUDE_QUERY_MOCK__?: typeof queryMock }).__AIF_CLAUDE_QUERY_MOCK__ =
+      queryMock;
+    queryMock.mockReset();
+    logActivityMock.mockReset();
+    incrementTaskTokenUsageMock.mockReset();
+    persistRuntimeProfileLimitSnapshotMock.mockReset();
+    clearRuntimeProfileLimitSnapshotMock.mockReset();
+    notifyProjectRuntimeLimitBroadcastMock.mockReset();
+    saveTaskSessionIdMock.mockReset();
+    getTaskSessionIdMock.mockReset();
+    findTaskByIdMock.mockReset();
+    resolveEffectiveRuntimeProfileMock.mockReset();
+    getTaskSessionIdMock.mockReturnValue(null);
+    findTaskByIdMock.mockReturnValue({
+      id: "task-1",
+      projectId: "project-1",
+      runtimeOptionsJson: null,
+      modelOverride: null,
+    });
+    resolveEffectiveRuntimeProfileMock.mockReturnValue({
+      source: "none",
+      profile: null,
+      taskRuntimeProfileId: null,
+      projectRuntimeProfileId: null,
+      systemRuntimeProfileId: null,
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("does not write raw provider error body to agent activity log", async () => {
+    queryMock.mockImplementation(async function* () {
+      throw new RuntimeExecutionError(
+        '429 {"error":"secret_token=abc sk-SECRET"}',
+        undefined,
+        "rate_limit",
+      );
+    });
+
+    await expect(
+      executeSubagentQuery({
+        taskId: "task-redaction",
+        projectRoot: "/tmp/project",
+        agentName: "implement-coordinator",
+        prompt: "run",
+        workflowKind: "implementer",
+      }),
+    ).rejects.toThrow("Runtime usage limit reached.");
+
+    const agentMessages = logActivityMock.mock.calls
+      .filter((call: unknown[]) => call[1] === "Agent")
+      .map((call: unknown[]) => String(call[2] ?? ""));
+    const combined = agentMessages.join("\n");
+
+    expect(combined).toContain("Runtime usage limit reached.");
+    expect(combined).not.toContain("secret_token");
+    expect(combined).not.toContain("sk-SECRET");
+  });
+
+  it("rethrows a sanitized runtime error without preserving the raw cause chain", async () => {
+    queryMock.mockImplementation(async function* () {
+      throw new RuntimeExecutionError(
+        '429 {"error":"secret_token=abc sk-SECRET"}',
+        undefined,
+        "rate_limit",
+      );
+    });
+
+    let captured: unknown;
+    try {
+      await executeSubagentQuery({
+        taskId: "task-redaction",
+        projectRoot: "/tmp/project",
+        agentName: "implement-coordinator",
+        prompt: "run",
+        workflowKind: "implementer",
+      });
+    } catch (error) {
+      captured = error;
+    }
+
+    expect(captured).toBeInstanceOf(RuntimeExecutionError);
+    if (!(captured instanceof RuntimeExecutionError)) {
+      throw new Error("Expected RuntimeExecutionError");
+    }
+    expect(captured.message).toBe("Runtime usage limit reached.");
+    expect(captured.category).toBe("rate_limit");
+    expect((captured as Error & { cause?: unknown }).cause).toBeUndefined();
+    expect(JSON.stringify(captured)).not.toContain("SECRET");
+  });
+
+  it("does not persist incidental runtime limit state when a non-limit runtime error follows", async () => {
+    queryMock.mockImplementation(async function* () {
+      yield {
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "allowed_warning",
+          rateLimitType: "five_hour",
+          utilization: 0.96,
+          resetsAt: 1_776_389_600,
+        },
+      };
+      throw new RuntimeExecutionError("Model missing", undefined, "model_not_found");
+    });
+
+    await expect(
+      executeSubagentQuery({
+        taskId: "task-redaction",
+        projectRoot: "/tmp/project",
+        agentName: "implement-coordinator",
+        prompt: "run",
+        workflowKind: "implementer",
+      }),
+    ).rejects.toThrow("Configured model was not found for the selected runtime.");
+
+    expect(persistRuntimeProfileLimitSnapshotMock).not.toHaveBeenCalled();
+    expect(notifyProjectRuntimeLimitBroadcastMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("executeSubagentQuery model fallback policy", () => {
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: vi.fn().mockResolvedValue({}),
+      }),
+    );
+    (globalThis as { __AIF_CLAUDE_QUERY_MOCK__?: typeof queryMock }).__AIF_CLAUDE_QUERY_MOCK__ =
+      queryMock;
+    queryMock.mockReset();
+    logActivityMock.mockReset();
+    incrementTaskTokenUsageMock.mockReset();
+    persistRuntimeProfileLimitSnapshotMock.mockReset();
+    clearRuntimeProfileLimitSnapshotMock.mockReset();
     saveTaskSessionIdMock.mockReset();
     getTaskSessionIdMock.mockReset();
     findTaskByIdMock.mockReset();
@@ -369,6 +1378,10 @@ describe("executeSubagentQuery model fallback policy", () => {
       projectRuntimeProfileId: null,
       systemRuntimeProfileId: null,
     });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("uses task modelOverride as highest priority", async () => {
@@ -462,6 +1475,14 @@ describe("executeSubagentQuery model fallback policy", () => {
 
 describe("executeSubagentQuery first-activity watchdog", () => {
   beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: vi.fn().mockResolvedValue({}),
+      }),
+    );
     (globalThis as { __AIF_CLAUDE_QUERY_MOCK__?: typeof queryMock }).__AIF_CLAUDE_QUERY_MOCK__ =
       queryMock;
     queryMock.mockReset();
@@ -482,6 +1503,10 @@ describe("executeSubagentQuery first-activity watchdog", () => {
       projectRuntimeProfileId: null,
       systemRuntimeProfileId: null,
     });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("retries and eventually throws when agent stalls on all attempts", async () => {

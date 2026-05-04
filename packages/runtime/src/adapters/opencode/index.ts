@@ -39,6 +39,7 @@ export interface CreateOpenCodeRuntimeAdapterOptions {
 
 const API_CAPABILITIES: RuntimeCapabilities = {
   supportsResume: true,
+  supportsSessionFork: false,
   supportsSessionList: true,
   supportsAgentDefinitions: false,
   supportsStreaming: true,
@@ -68,7 +69,7 @@ const DEFAULT_OPENCODE_MODELS: RuntimeModel[] = [
 function createFallbackLogger(): OpenCodeRuntimeAdapterLogger {
   return {
     debug(context, message) {
-      console.debug("DEBUG [runtime:opencode]", message, context);
+      console.debug("[runtime:opencode]", message, context);
     },
     info(context, message) {
       console.info("INFO [runtime:opencode]", message, context);

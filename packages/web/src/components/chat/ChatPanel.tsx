@@ -4,6 +4,7 @@ import {
   useState,
   useCallback,
   type KeyboardEvent as ReactKeyboardEvent,
+  type DragEvent as ReactDragEvent,
 } from "react";
 import { createPortal } from "react-dom";
 import { useOutsideClick } from "@/hooks/useOutsideClick";
@@ -17,23 +18,35 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Paperclip,
-  AlertTriangle,
+  Square,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { AttachmentChip } from "@/components/ui/attachment-chip";
 import { useChat } from "@/hooks/useChat";
 import { useChatSessions } from "@/hooks/useChatSessions";
 import { useTask } from "@/hooks/useTasks";
 import { useEffectiveChatRuntime, useRuntimeProfiles } from "@/hooks/useRuntimeProfiles";
-import { toAttachmentPayload } from "@/components/task/useTaskDetailActions";
+import { useUsageLimitsEnabled } from "@/hooks/useSettings";
+import {
+  toAttachmentPayload,
+  partitionBySize,
+  ATTACHMENT_SIZE_HARD_LIMIT,
+} from "@/components/task/useTaskDetailActions";
+import { getRuntimeLimitDisplay } from "@/lib/runtimeLimits";
+import { formatRuntimeProfileName } from "@/lib/runtimeProfiles";
+import { readDroppedFiles, summarizeAttachments } from "@/lib/attachmentTransfer";
 import { SessionList } from "./SessionList";
 import { MessageBubble } from "./MessageBubble";
 import { TypingIndicator } from "./TypingIndicator";
 import type { ChatAttachment } from "@aif/shared/browser";
+
+export const MAX_CHAT_ATTACHMENTS = 100;
+const CHAT_ATTACHMENT_WARN_AT = 50;
 
 interface ChatPanelProps {
   isOpen: boolean;
@@ -56,6 +69,7 @@ export function ChatPanel({
 
   const {
     sessions,
+    isLoading: isLoadingSessions,
     activeSessionId,
     setActiveSessionId,
     pinActiveSession,
@@ -64,16 +78,27 @@ export function ChatPanel({
     renameSession,
   } = useChatSessions(projectId);
 
+  const activeSession = sessions.find((s) => s.id === activeSessionId);
+
   const {
     messages,
     isStreaming,
+    isLoadingMessages,
     chatErrorCode,
+    chatRuntimeLimitSnapshot,
     explore,
     setExplore,
     sendMessage,
+    abortStream,
     clearMessages,
     newSession,
-  } = useChat(projectId, activeSessionId, taskId, setActiveSessionId);
+  } = useChat(
+    projectId,
+    activeSessionId,
+    taskId,
+    setActiveSessionId,
+    activeSession?.runtimeProfileId ?? null,
+  );
 
   const { data: currentTask } = useTask(taskId);
   const { data: effectiveChatRuntime } = useEffectiveChatRuntime(projectId);
@@ -105,19 +130,34 @@ export function ChatPanel({
 
   const handleSend = () => {
     if (!input.trim() || isStreaming) return;
-    const forceNew = runtimeMismatch;
-    if (!forceNew) {
-      pinActiveSession();
-    }
+    pinActiveSession();
     const files = pendingFiles.length > 0 ? pendingFiles : undefined;
-    void sendMessage(input, files, forceNew);
+    void sendMessage(input, files, false);
     setInput("");
     setPendingFiles([]);
+    setOversizeNotice([]);
   };
 
-  const handleFilesSelected = async (fileList: FileList) => {
+  const [oversizeNotice, setOversizeNotice] = useState<string[]>([]);
+
+  const handleFilesSelected = async (input: FileList | File[]) => {
+    const arr = Array.isArray(input) ? input : Array.from(input);
+    const { accepted, rejected } = partitionBySize(arr);
+    if (rejected.length > 0) {
+      console.warn(
+        "[chat] dropping %d files over %d bytes: %s",
+        rejected.length,
+        ATTACHMENT_SIZE_HARD_LIMIT,
+        rejected.map((f) => f.name).join(", "),
+      );
+      setOversizeNotice(rejected.map((f) => f.name));
+    } else {
+      setOversizeNotice([]);
+    }
+    const remaining = MAX_CHAT_ATTACHMENTS - pendingFiles.length;
+    if (remaining <= 0) return;
     const newFiles: ChatAttachment[] = [];
-    for (const file of Array.from(fileList).slice(0, 5 - pendingFiles.length)) {
+    for (const file of accepted.slice(0, remaining)) {
       const payload = await toAttachmentPayload(file);
       newFiles.push({
         name: payload.name,
@@ -126,7 +166,29 @@ export function ChatPanel({
         content: payload.content,
       });
     }
-    setPendingFiles((prev) => [...prev, ...newFiles].slice(0, 5));
+    setPendingFiles((prev) => [...prev, ...newFiles].slice(0, MAX_CHAT_ATTACHMENTS));
+  };
+
+  const [composerDragOver, setComposerDragOver] = useState(false);
+
+  const handleComposerDragOver = (e: ReactDragEvent) => {
+    if (!Array.from(e.dataTransfer.types ?? []).includes("Files")) return;
+    e.preventDefault();
+    setComposerDragOver(true);
+  };
+
+  const handleComposerDragLeave = (e: ReactDragEvent) => {
+    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+    setComposerDragOver(false);
+  };
+
+  const handleComposerDrop = (e: ReactDragEvent) => {
+    if (!Array.from(e.dataTransfer.types ?? []).includes("Files")) return;
+    e.preventDefault();
+    setComposerDragOver(false);
+    void readDroppedFiles(e.dataTransfer).then((files) => {
+      if (files.length > 0) void handleFilesSelected(files);
+    });
   };
 
   const handleKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
@@ -167,17 +229,7 @@ export function ChatPanel({
     [renameSession],
   );
 
-  // Find active session title
-  const activeSession = sessions.find((s) => s.id === activeSessionId);
-
-  // Detect runtime mismatch: session was created with a different runtime profile
-  const currentProfileId = effectiveChatRuntime?.profile?.id ?? null;
   const sessionProfileId = activeSession?.runtimeProfileId ?? null;
-  const runtimeMismatch =
-    Boolean(activeSession) &&
-    Boolean(sessionProfileId) &&
-    Boolean(currentProfileId) &&
-    sessionProfileId !== currentProfileId;
 
   // Show the session's own runtime when it has one, otherwise show the project effective runtime
   const sessionProfile = sessionProfileId
@@ -185,8 +237,14 @@ export function ChatPanel({
     : null;
   const displayProfile = sessionProfile ?? effectiveChatRuntime?.profile ?? null;
   const activeRuntimeProfileName =
-    displayProfile?.name ??
-    (effectiveChatRuntime?.source === "none" ? "Default runtime" : "Unnamed profile");
+    (displayProfile ? formatRuntimeProfileName(displayProfile) : null) ??
+    (effectiveChatRuntime?.source === "system_default"
+      ? "App default"
+      : effectiveChatRuntime?.source === "project_default"
+        ? "Project default"
+        : effectiveChatRuntime?.source === "none"
+          ? "Env fallback"
+          : "Unnamed profile");
   const activeRuntimeEngine = displayProfile
     ? `${displayProfile.runtimeId}/${displayProfile.providerId}`
     : effectiveChatRuntime?.resolved
@@ -194,6 +252,51 @@ export function ChatPanel({
       : "n/a";
   const activeRuntimeModel =
     displayProfile?.defaultModel ?? effectiveChatRuntime?.resolved?.model ?? "auto";
+  const usageLimitsEnabled = useUsageLimitsEnabled();
+  const chatRuntimeLimitDisplay = usageLimitsEnabled
+    ? getRuntimeLimitDisplay(
+        chatRuntimeLimitSnapshot ?? displayProfile?.runtimeLimitSnapshot ?? null,
+        {
+          checkedAt:
+            displayProfile?.runtimeLimitUpdatedAt ?? chatRuntimeLimitSnapshot?.checkedAt ?? null,
+        },
+      )
+    : null;
+  const chatRuntimeLimitTone = chatRuntimeLimitDisplay?.tone ?? "warning";
+  const chatRuntimeLimitContainerClassName = cn(
+    "mt-2 border px-2.5 py-2",
+    chatRuntimeLimitTone === "warning" &&
+      "border-amber-500/50 bg-amber-500/15 text-amber-700 dark:text-amber-200/90",
+    chatRuntimeLimitTone === "error" && "border-destructive/40 bg-destructive/10 text-destructive",
+    chatRuntimeLimitTone === "success" &&
+      "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+    chatRuntimeLimitTone === "info" && "border-border bg-card/60 text-foreground",
+  );
+  const chatRuntimeLimitLabel = chatRuntimeLimitDisplay
+    ? chatRuntimeLimitDisplay.state === "expired"
+      ? "Limit Window Expired"
+      : chatRuntimeLimitDisplay.state === "signal_no_reset"
+        ? "Limit Signal (No Reset)"
+        : chatRuntimeLimitDisplay.state === "historical"
+          ? "Historical Limit Signal"
+          : chatRuntimeLimitDisplay.label === "Blocked"
+            ? "Runtime Blocked"
+            : chatRuntimeLimitDisplay.label === "Healthy"
+              ? "Runtime Healthy"
+              : "Runtime Near Limit"
+    : "Usage Limit Reached";
+  const chatRuntimeLimitSummary =
+    chatRuntimeLimitDisplay?.summary ??
+    "Runtime usage limit is currently exhausted. Wait for reset time and send again.";
+  const chatRuntimeLimitMeta =
+    chatRuntimeLimitDisplay &&
+    [
+      chatRuntimeLimitDisplay.resetText,
+      chatRuntimeLimitDisplay.taskRetryText,
+      chatRuntimeLimitDisplay.checkedText,
+    ]
+      .filter(Boolean)
+      .join(" ");
 
   const content = (
     <div
@@ -287,6 +390,26 @@ export function ChatPanel({
             {activeRuntimeModel}
           </Badge>
         </div>
+        {chatRuntimeLimitDisplay && (
+          <div className={chatRuntimeLimitContainerClassName}>
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Badge
+                variant="outline"
+                className={cn(
+                  "border-current/40",
+                  chatRuntimeLimitTone === "info" && "text-foreground",
+                )}
+              >
+                {chatRuntimeLimitLabel}
+              </Badge>
+              <span className="text-[11px] opacity-80">{activeRuntimeProfileName}</span>
+            </div>
+            <p className="mt-1 text-xs">{chatRuntimeLimitSummary}</p>
+            {chatRuntimeLimitMeta && (
+              <p className="mt-1 text-[11px] opacity-80">{chatRuntimeLimitMeta}</p>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Content area: sessions sidebar + messages */}
@@ -308,32 +431,42 @@ export function ChatPanel({
 
         {/* Messages area */}
         <div className="flex-1 overflow-y-auto overscroll-contain py-2">
-          {runtimeMismatch && (
+          {chatErrorCode === "aborted" && (
             <div className="px-3 pb-2">
-              <div className="flex items-center gap-1.5 rounded border border-amber-500/50 bg-amber-500/15 px-2.5 py-1.5">
-                <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
-                <span className="text-xs text-amber-700/90 dark:text-amber-200/90">
-                  Runtime changed — next message will start a new session
-                </span>
-              </div>
-            </div>
-          )}
-          {chatErrorCode === "CHAT_USAGE_LIMIT" && (
-            <div className="px-3 pb-2">
-              <div className="rounded border border-amber-500/50 bg-amber-500/15 p-2">
-                <Badge
-                  variant="outline"
-                  className="border-amber-600/60 text-amber-700 dark:border-amber-400/50 dark:text-amber-300"
-                >
-                  Usage Limit Reached
+              <div className="rounded border border-muted-foreground/30 bg-muted/40 p-2">
+                <Badge variant="outline" className="border-muted-foreground/50">
+                  Stopped
                 </Badge>
-                <p className="mt-1 text-xs text-amber-700/90 dark:text-amber-200/90">
-                  Runtime usage limit is currently exhausted. Wait for reset time and send again.
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Chat run was stopped. Any partial reply above has been saved.
                 </p>
               </div>
             </div>
           )}
-          {messages.length === 0 && (
+          {usageLimitsEnabled &&
+            chatErrorCode === "CHAT_USAGE_LIMIT" &&
+            !chatRuntimeLimitDisplay && (
+              <div className="px-3 pb-2">
+                <div className="rounded border border-amber-500/50 bg-amber-500/15 p-2">
+                  <Badge
+                    variant="outline"
+                    className="border-amber-600/60 text-amber-700 dark:border-amber-400/50 dark:text-amber-300"
+                  >
+                    Usage Limit Reached
+                  </Badge>
+                  <p className="mt-1 text-xs text-amber-700/90 dark:text-amber-200/90">
+                    Runtime usage limit is currently exhausted. Wait for reset time and send again.
+                  </p>
+                </div>
+              </div>
+            )}
+          {(isLoadingMessages || isLoadingSessions) && (
+            <div className="flex h-full flex-col items-center justify-center gap-2 text-muted-foreground">
+              <Spinner size="lg" />
+              <p className="text-xs">Loading messages...</p>
+            </div>
+          )}
+          {!isLoadingMessages && !isLoadingSessions && messages.length === 0 && (
             <div className="flex h-full flex-col items-center justify-center gap-2 text-muted-foreground">
               <Bot className="h-8 w-8 opacity-30" />
               <p className="text-xs">
@@ -341,16 +474,18 @@ export function ChatPanel({
               </p>
             </div>
           )}
-          {messages.map((msg, i) => (
-            <MessageBubble
-              key={i}
-              message={msg}
-              projectId={projectId ?? ""}
-              sessionId={activeSessionId}
-              onTaskCreated={handleTaskCreated}
-              onOpenTask={onOpenTask}
-            />
-          ))}
+          {!isLoadingMessages &&
+            !isLoadingSessions &&
+            messages.map((msg, i) => (
+              <MessageBubble
+                key={i}
+                message={msg}
+                projectId={projectId ?? ""}
+                sessionId={activeSessionId}
+                onTaskCreated={handleTaskCreated}
+                onOpenTask={onOpenTask}
+              />
+            ))}
           {isStreaming && (
             <TypingIndicator
               hasAssistantMessage={messages[messages.length - 1]?.role === "assistant"}
@@ -361,7 +496,15 @@ export function ChatPanel({
       </div>
 
       {/* Input area */}
-      <div className="border-t border-border p-3">
+      <div
+        className={cn(
+          "border-t p-3 transition-colors",
+          composerDragOver ? "border-primary bg-primary/5" : "border-border",
+        )}
+        onDragOver={handleComposerDragOver}
+        onDragLeave={handleComposerDragLeave}
+        onDrop={handleComposerDrop}
+      >
         <label className="mb-1.5 flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer">
           <Checkbox
             checked={explore}
@@ -371,15 +514,41 @@ export function ChatPanel({
           <span title="Brainstorm, research or explore a topic">Explore</span>
         </label>
         {pendingFiles.length > 0 && (
-          <div className="mb-1.5 flex flex-wrap gap-1">
-            {pendingFiles.map((f, i) => (
-              <AttachmentChip
-                key={i}
-                name={f.name}
-                onRemove={() => setPendingFiles((prev) => prev.filter((_, j) => j !== i))}
-              />
-            ))}
-          </div>
+          <>
+            <div className="mb-1.5 flex flex-wrap gap-1">
+              {pendingFiles.map((f, i) => (
+                <AttachmentChip
+                  key={i}
+                  name={f.name}
+                  onRemove={() => setPendingFiles((prev) => prev.filter((_, j) => j !== i))}
+                />
+              ))}
+            </div>
+            <p className="mb-1 text-2xs text-muted-foreground">
+              {summarizeAttachments(pendingFiles)}
+              {pendingFiles.length >= CHAT_ATTACHMENT_WARN_AT &&
+                pendingFiles.length < MAX_CHAT_ATTACHMENTS && (
+                  <span className="ml-1 text-amber-600 dark:text-amber-400">
+                    · large batch may slow the agent
+                  </span>
+                )}
+              {pendingFiles.length >= MAX_CHAT_ATTACHMENTS && (
+                <span className="ml-1 text-amber-600 dark:text-amber-400">
+                  · cap reached ({MAX_CHAT_ATTACHMENTS})
+                </span>
+              )}
+            </p>
+          </>
+        )}
+        {composerDragOver && (
+          <p className="mb-1 text-2xs text-primary">Drop files or folders to attach (recursive).</p>
+        )}
+        {oversizeNotice.length > 0 && (
+          <p className="mb-1 text-2xs text-amber-600 dark:text-amber-400">
+            Skipped {oversizeNotice.length} file{oversizeNotice.length === 1 ? "" : "s"} over{" "}
+            {ATTACHMENT_SIZE_HARD_LIMIT / 1_000_000}MB: {oversizeNotice.slice(0, 3).join(", ")}
+            {oversizeNotice.length > 3 ? `, …` : ""}
+          </p>
         )}
         <div className="flex items-end gap-2">
           <input
@@ -398,7 +567,7 @@ export function ChatPanel({
             variant="ghost"
             size="icon"
             onClick={() => fileInputRef.current?.click()}
-            disabled={isStreaming || pendingFiles.length >= 5}
+            disabled={isStreaming || pendingFiles.length >= MAX_CHAT_ATTACHMENTS}
             className="h-9 w-9 shrink-0 border-0 text-muted-foreground"
             aria-label="Attach file"
           >
@@ -411,16 +580,28 @@ export function ChatPanel({
             onKeyDown={handleKeyDown}
             placeholder="Ask a question..."
             rows={1}
-            className="max-h-32 min-h-[2.25rem] flex-1 resize-none bg-secondary/50"
+            containerClassName="flex-1"
+            className="max-h-32 min-h-[2.25rem] resize-none bg-secondary/50"
           />
-          <Button
-            onClick={handleSend}
-            disabled={!input.trim() || isStreaming}
-            aria-label="Send message"
-            className="h-auto self-stretch w-9 shrink-0 rounded px-0"
-          >
-            <Send className="h-4 w-4 shrink-0" />
-          </Button>
+          {isStreaming ? (
+            <Button
+              onClick={() => void abortStream()}
+              aria-label="Stop generation"
+              variant="destructive"
+              className="h-auto self-stretch w-9 shrink-0 rounded px-0"
+            >
+              <Square className="h-4 w-4 shrink-0" />
+            </Button>
+          ) : (
+            <Button
+              onClick={handleSend}
+              disabled={!input.trim()}
+              aria-label="Send message"
+              className="h-auto self-stretch w-9 shrink-0 rounded px-0"
+            >
+              <Send className="h-4 w-4 shrink-0" />
+            </Button>
+          )}
         </div>
       </div>
     </div>

@@ -1,16 +1,25 @@
 // Schema
 export {
   projects,
+  appSettings,
   tasks,
   taskComments,
   runtimeProfiles,
   chatSessions,
   chatMessages,
   usageEvents,
+  runtimeWarmupSessions,
+  codexSessions,
+  codexSessionFiles,
+  codexLimitHeads,
+  codexLimitHistory,
+  codexIndexCursors,
 } from "./schema.js";
 export type {
   ProjectRow,
   NewProjectRow,
+  AppSettingsRow,
+  NewAppSettingsRow,
   TaskRow,
   NewTaskRow,
   TaskCommentRow,
@@ -23,6 +32,19 @@ export type {
   NewChatMessageRow,
   UsageEventRow,
   NewUsageEventRow,
+  RuntimeWarmupSessionStatus,
+  RuntimeWarmupSessionRow,
+  NewRuntimeWarmupSessionRow,
+  CodexSessionRow,
+  NewCodexSessionRow,
+  CodexSessionFileRow,
+  NewCodexSessionFileRow,
+  CodexLimitHeadRow,
+  NewCodexLimitHeadRow,
+  CodexLimitHistoryRow,
+  NewCodexLimitHistoryRow,
+  CodexIndexCursorRow,
+  NewCodexIndexCursorRow,
 } from "./schema.js";
 
 // Types
@@ -37,6 +59,8 @@ export {
   type AutoReviewState,
   type Project,
   type CreateProjectInput,
+  type AppSettings,
+  type UpdateAppSettingsInput,
   type Task,
   type CreateTaskInput,
   type UpdateTaskInput,
@@ -60,11 +84,20 @@ export {
   isRuntimeTransport,
   RUNTIME_TRANSPORTS,
   RuntimeTransport,
+  type RuntimeProfileUsage,
   type RuntimeProfile,
   type CreateRuntimeProfileInput,
   type UpdateRuntimeProfileInput,
   type EffectiveRuntimeProfileSource,
   type EffectiveRuntimeProfileSelection,
+  RuntimeLimitSource,
+  RuntimeLimitStatus,
+  RuntimeLimitPrecision,
+  RuntimeLimitScope,
+  type RuntimeLimitWindow,
+  type RuntimeLimitSnapshot,
+  type RuntimeLimitEventPayload,
+  type WarmupBroadcastPayload,
   type ChatSessionSource,
   type ChatSession,
   type CreateChatSessionInput,
@@ -76,11 +109,21 @@ export {
 export { getDb, createTestDb, closeDb } from "./db.js";
 
 // Environment
-export { getEnv, validateEnv } from "./env.js";
+export { getEnv, validateEnv, resetEnvCache } from "./env.js";
 export type { Env } from "./env.js";
 
 // Constants
-export { STATUS_CONFIG, ORDERED_STATUSES } from "./constants.js";
+export {
+  STATUS_CONFIG,
+  ORDERED_STATUSES,
+  WARMUP_TARGETS,
+  WARMUP_WORKFLOW_KINDS,
+  DEFAULT_WARMUP_TARGET,
+  isWarmupWorkflowKind,
+  type WarmupTarget,
+  type WarmupWorkflowKind,
+  type WarmupProfileMode,
+} from "./constants.js";
 export { applyHumanTaskEvent, HUMAN_ACTIONS_BY_STATUS, CLEAN_STATE_RESET } from "./stateMachine.js";
 
 // Logger
@@ -102,6 +145,33 @@ export { persistTaskPlan } from "./taskPlan.js";
 
 // Path validation
 export { validateProjectRootPath } from "./pathValidation.js";
+
+// Git/worktree isolation utilities (Node-only)
+export {
+  BranchIsolationError,
+  assertCurrentBranch,
+  assertWorkingTreeClean,
+  branchExists,
+  buildBranchName,
+  buildTaskWorktreePath,
+  describeDirtyWorkingTree,
+  ensureFeatureBranch,
+  ensureTaskWorktree,
+  getCurrentBranch,
+  isBranchIsolationError,
+  isGitRepo,
+  projectSupportsTaskWorktrees,
+  projectUsesSharedBranchIsolation,
+  restorePersistedBranch,
+  slugifyTitle,
+  validateBranchName,
+  workingTreeClean,
+  type EnsureFeatureBranchInput,
+  type EnsureFeatureBranchResult,
+  type EnsureTaskWorktreeInput,
+  type EnsureTaskWorktreeResult,
+  type RestorePersistedBranchInput,
+} from "./gitIsolation.js";
 
 // Attachment utilities
 export {
@@ -134,6 +204,7 @@ export {
   type AifProjectPaths,
   type AifProjectWorkflow,
   type AifProjectGit,
+  type AifProjectLanguage,
 } from "./projectConfig.js";
 
 // Telegram notifications
@@ -150,3 +221,21 @@ export type { PlannerMode, PlannerFlagDefaults } from "./plannerDefaults.js";
 // Utilities
 export { withTimeout } from "./withTimeout.js";
 export { parseMcpPortSetting, type ParsedMcpPortSetting } from "./mcpPort.js";
+
+// Runtime-limit shared helpers
+export {
+  buildRuntimeLimitSignature,
+  mapSafeRuntimeErrorReason,
+  normalizeRuntimeLimitSnapshot,
+  redactProviderText,
+  redactProviderTextForLogs,
+  resolveRuntimeLimitFutureHint,
+  sanitizeRuntimeLimitSnapshotForExposure,
+  sanitizeProviderMeta,
+  selectViolatedWindowForExactThreshold,
+  type RuntimeLimitFutureHint,
+  type RuntimeLimitFutureHintSource,
+  type RuntimeLimitSnapshotExposure,
+  type SafeRuntimeErrorCategory,
+  type SafeRuntimeErrorReason,
+} from "./runtimeLimitUtils.js";

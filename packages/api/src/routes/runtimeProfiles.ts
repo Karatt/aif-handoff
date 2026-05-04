@@ -1,31 +1,45 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import {
+  buildCodexAuthFingerprint,
   createRuntimeWorkflowSpec,
+  getCodexAuthIdentity,
   isValidEnvVarName,
   redactResolvedRuntimeProfile,
+  resolveClaudeProviderIdentity,
   resolveRuntimeProfile,
+  RuntimeTransport,
 } from "@aif/runtime";
-import { getEnv, logger } from "@aif/shared";
+import {
+  getEnv,
+  logger,
+  normalizeRuntimeLimitSnapshot,
+  type RuntimeLimitSnapshot,
+} from "@aif/shared";
 import {
   createRuntimeProfile,
   deleteRuntimeProfile,
   findRuntimeProfileById,
+  findProjectById,
   findTaskById,
-  listRuntimeProfiles,
+  getRuntimeProfileResponseById,
+  listRuntimeProfileResponses,
+  getAppDefaultRuntimeProfileId,
   resolveEffectiveRuntimeProfile,
   toRuntimeProfileResponse,
   updateRuntimeProfile,
 } from "@aif/data";
 import {
   createRuntimeProfileSchema,
+  runtimeProfileListQuerySchema,
   runtimeProfileModelsSchema,
   runtimeProfileValidationSchema,
   updateRuntimeProfileSchema,
 } from "../schemas.js";
 import { getApiRuntimeModelDiscoveryService, getApiRuntimeRegistry } from "../services/runtime.js";
+import { resolveCachedCodexOverlaySnapshot } from "../services/codexOverlayCache.js";
 import { createRateLimiter } from "../middleware/rateLimit.js";
-import { jsonValidator } from "../middleware/zodValidator.js";
+import { jsonValidator, queryValidator } from "../middleware/zodValidator.js";
 
 const log = logger("runtime-profile-route");
 
@@ -92,6 +106,330 @@ function sanitizeBooleanQuery(value: string | undefined, fallback = false): bool
   return value === "1" || value.toLowerCase() === "true";
 }
 
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isLocalCodexProfile(profile: { runtimeId: string; transport?: string | null }): boolean {
+  return profile.runtimeId === "codex"
+    ? profile.transport === RuntimeTransport.SDK ||
+        profile.transport === RuntimeTransport.CLI ||
+        profile.transport === RuntimeTransport.APP_SERVER
+    : false;
+}
+
+function isClaudeProfile(profile: { runtimeId: string }): boolean {
+  return profile.runtimeId === "claude";
+}
+
+function readProviderMetaString(
+  providerMeta: Record<string, unknown> | null | undefined,
+  key: string,
+): string | null {
+  const value = providerMeta?.[key];
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+interface LocalCodexAccountProfileLike {
+  id: string;
+  projectId?: string | null;
+  runtimeId: string;
+  providerId: string;
+  transport?: string | null;
+  defaultModel?: string | null;
+  runtimeLimitSnapshot?: RuntimeLimitSnapshot | null;
+  runtimeLimitUpdatedAt?: string | null;
+}
+
+interface ClaudeIdentityProfileLike {
+  runtimeId: string;
+  providerId: string;
+  transport?: string | null;
+  baseUrl?: string | null;
+  apiKeyEnvVar?: string | null;
+  defaultModel?: string | null;
+  runtimeLimitSnapshot?: RuntimeLimitSnapshot | null;
+}
+
+function enrichProfileWithCodexIdentity<T extends LocalCodexAccountProfileLike>(
+  profile: T,
+  identity: Awaited<ReturnType<typeof getCodexAuthIdentity>>,
+): T {
+  if (!isLocalCodexProfile(profile) || !profile.runtimeLimitSnapshot || !identity) {
+    return profile;
+  }
+
+  const snapshot = profile.runtimeLimitSnapshot;
+  const providerMeta = isObjectRecord(snapshot.providerMeta) ? snapshot.providerMeta : {};
+  const nextProviderMeta = {
+    ...providerMeta,
+    ...(readProviderMetaString(providerMeta, "accountId") ? {} : { accountId: identity.accountId }),
+    ...(readProviderMetaString(providerMeta, "authMode") ? {} : { authMode: identity.authMode }),
+    ...(readProviderMetaString(providerMeta, "accountName")
+      ? {}
+      : { accountName: identity.accountName }),
+    ...(readProviderMetaString(providerMeta, "accountEmail")
+      ? {}
+      : { accountEmail: identity.accountEmail }),
+    ...(readProviderMetaString(providerMeta, "planType") ? {} : { planType: identity.planType }),
+  };
+
+  return {
+    ...profile,
+    runtimeLimitSnapshot: normalizeRuntimeLimitSnapshot({
+      ...snapshot,
+      providerMeta: nextProviderMeta,
+    }),
+  };
+}
+
+async function enrichProfilesWithCodexIdentity<T extends LocalCodexAccountProfileLike>(
+  profiles: T[],
+): Promise<T[]> {
+  if (!profiles.some((profile) => isLocalCodexProfile(profile) && profile.runtimeLimitSnapshot)) {
+    return profiles;
+  }
+
+  const identity = await getCodexAuthIdentity();
+  if (!identity) {
+    return profiles;
+  }
+
+  return profiles.map((profile) => enrichProfileWithCodexIdentity(profile, identity));
+}
+
+function parseTimestampMs(value: string | null | undefined): number {
+  if (!value) return Number.NEGATIVE_INFINITY;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+}
+
+function applyCodexSnapshotToProfile<T extends RuntimeLimitSnapshot>(
+  snapshot: T,
+  profileId: string,
+): T {
+  const nextSnapshot = snapshot.profileId === profileId ? snapshot : { ...snapshot, profileId };
+  return normalizeRuntimeLimitSnapshot(nextSnapshot) as unknown as T;
+}
+
+function createCodexIndexedSnapshotLookup() {
+  let authFingerprintPromise: Promise<string | null> | null = null;
+
+  const readAuthFingerprint = async (): Promise<string | null> => {
+    if (!authFingerprintPromise) {
+      authFingerprintPromise = getCodexAuthIdentity().then((identity) =>
+        buildCodexAuthFingerprint(identity),
+      );
+    }
+    return await authFingerprintPromise;
+  };
+
+  return {
+    async resolveAccountFingerprint(profile: LocalCodexAccountProfileLike): Promise<string | null> {
+      const providerMeta = isObjectRecord(profile.runtimeLimitSnapshot?.providerMeta)
+        ? profile.runtimeLimitSnapshot?.providerMeta
+        : null;
+      const embeddedFingerprint = readProviderMetaString(providerMeta, "accountFingerprint");
+      if (embeddedFingerprint) {
+        return embeddedFingerprint;
+      }
+      return await readAuthFingerprint();
+    },
+    getSelected(input: {
+      accountFingerprint: string;
+      projectRoot?: string | null;
+      preferredLimitId?: string | null;
+      model?: string | null;
+    }): RuntimeLimitSnapshot | null {
+      return resolveCachedCodexOverlaySnapshot({
+        accountFingerprint: input.accountFingerprint,
+        projectRoot: input.projectRoot ?? null,
+        preferredLimitId: input.preferredLimitId ?? null,
+        model: input.model ?? null,
+      });
+    },
+  };
+}
+
+async function refreshProfileWithIndexedCodexLimit<T extends LocalCodexAccountProfileLike>(
+  profile: T,
+  selectedProjectId?: string | null,
+  snapshotLookup = createCodexIndexedSnapshotLookup(),
+): Promise<T> {
+  // Usage-limits feature is the expensive-I/O path (Codex session scan,
+  // Claude identity network call). Gate here so a deployment can opt out
+  // via AIF_USAGE_LIMITS_ENABLED=false and skip all associated work.
+  if (!getEnv().AIF_USAGE_LIMITS_ENABLED) {
+    return profile;
+  }
+
+  if (!isLocalCodexProfile(profile)) {
+    return profile;
+  }
+
+  const model = profile.defaultModel?.trim() ?? null;
+  if (!model) {
+    return profile;
+  }
+
+  const effectiveProjectId = profile.projectId ?? selectedProjectId ?? null;
+  const projectRoot = effectiveProjectId
+    ? (findProjectById(effectiveProjectId)?.rootPath ?? null)
+    : null;
+  const persistedProviderMeta = isObjectRecord(profile.runtimeLimitSnapshot?.providerMeta)
+    ? profile.runtimeLimitSnapshot.providerMeta
+    : null;
+  const persistedLimitId = readProviderMetaString(persistedProviderMeta, "limitId");
+  const accountFingerprint = await snapshotLookup.resolveAccountFingerprint(profile);
+  if (!accountFingerprint) {
+    log.debug(
+      {
+        profileId: profile.id,
+        projectId: effectiveProjectId,
+        projectRoot,
+      },
+      "[runtime-profile-route] Skipping indexed Codex overlay because no account fingerprint is available",
+    );
+    return profile;
+  }
+
+  const selectedSnapshot = snapshotLookup.getSelected({
+    accountFingerprint,
+    projectRoot,
+    preferredLimitId: persistedLimitId,
+    model,
+  });
+  if (!selectedSnapshot) {
+    log.debug(
+      {
+        profileId: profile.id,
+        projectId: effectiveProjectId,
+        projectRoot,
+      },
+      "[runtime-profile-route] No indexed Codex overlay snapshot selected for profile",
+    );
+    return profile;
+  }
+
+  const persistedAtMs = Math.max(
+    parseTimestampMs(profile.runtimeLimitUpdatedAt ?? null),
+    parseTimestampMs(profile.runtimeLimitSnapshot?.checkedAt ?? null),
+  );
+  const indexedCheckedAtMs = parseTimestampMs(selectedSnapshot.checkedAt);
+  log.debug(
+    {
+      profileId: profile.id,
+      projectId: effectiveProjectId,
+      projectRoot,
+      persistedAtMs: Number.isFinite(persistedAtMs) ? persistedAtMs : null,
+      indexedCheckedAtMs: Number.isFinite(indexedCheckedAtMs) ? indexedCheckedAtMs : null,
+    },
+    "[runtime-profile-route] Evaluated indexed Codex overlay snapshot freshness",
+  );
+  if (persistedAtMs > indexedCheckedAtMs) {
+    return profile;
+  }
+
+  return {
+    ...profile,
+    runtimeLimitSnapshot: applyCodexSnapshotToProfile(selectedSnapshot, profile.id),
+    runtimeLimitUpdatedAt: selectedSnapshot.checkedAt,
+  };
+}
+
+async function refreshProfilesWithIndexedCodexLimits<T extends LocalCodexAccountProfileLike>(
+  profiles: T[],
+  selectedProjectId?: string | null,
+): Promise<T[]> {
+  if (!getEnv().AIF_USAGE_LIMITS_ENABLED) {
+    return profiles;
+  }
+  const snapshotLookup = createCodexIndexedSnapshotLookup();
+  return await Promise.all(
+    profiles.map((profile) =>
+      refreshProfileWithIndexedCodexLimit(profile, selectedProjectId, snapshotLookup),
+    ),
+  );
+}
+
+async function enrichProfileWithClaudeIdentity<T extends ClaudeIdentityProfileLike>(
+  profile: T,
+): Promise<T> {
+  if (!getEnv().AIF_USAGE_LIMITS_ENABLED) {
+    return profile;
+  }
+  if (!isClaudeProfile(profile) || !profile.runtimeLimitSnapshot) {
+    return profile;
+  }
+
+  const identity = await resolveClaudeProviderIdentity({
+    providerId: profile.providerId,
+    transport: profile.transport ?? null,
+    baseUrl: profile.baseUrl ?? null,
+    apiKeyEnvVar: profile.apiKeyEnvVar ?? null,
+    defaultModel: profile.defaultModel ?? null,
+    env: process.env,
+  });
+  const snapshot = profile.runtimeLimitSnapshot;
+  const providerMeta = isObjectRecord(snapshot.providerMeta) ? snapshot.providerMeta : {};
+  const nextProviderMeta = {
+    ...providerMeta,
+    ...(readProviderMetaString(providerMeta, "providerFamily")
+      ? {}
+      : { providerFamily: identity.providerFamily }),
+    ...(readProviderMetaString(providerMeta, "providerLabel")
+      ? {}
+      : { providerLabel: identity.providerLabel }),
+    ...(readProviderMetaString(providerMeta, "quotaSource")
+      ? {}
+      : { quotaSource: identity.quotaSource }),
+    ...(readProviderMetaString(providerMeta, "accountFingerprint")
+      ? {}
+      : { accountFingerprint: identity.accountFingerprint }),
+    ...(readProviderMetaString(providerMeta, "accountLabel")
+      ? {}
+      : { accountLabel: identity.accountLabel }),
+  };
+
+  return {
+    ...profile,
+    runtimeLimitSnapshot: normalizeRuntimeLimitSnapshot({
+      ...snapshot,
+      providerMeta: nextProviderMeta,
+    }),
+  };
+}
+
+async function enrichProfilesWithProviderIdentity<
+  T extends LocalCodexAccountProfileLike & ClaudeIdentityProfileLike,
+>(profiles: T[]): Promise<T[]> {
+  if (!getEnv().AIF_USAGE_LIMITS_ENABLED) {
+    return profiles;
+  }
+  const withCodexIdentity = await enrichProfilesWithCodexIdentity(profiles);
+  return await Promise.all(
+    withCodexIdentity.map((profile) => enrichProfileWithClaudeIdentity(profile)),
+  );
+}
+
+function compareVisibleRuntimeProfiles(
+  left: { id: string; projectId: string | null; createdAt: string },
+  right: { id: string; projectId: string | null; createdAt: string },
+): number {
+  const leftRank = left.projectId == null ? 0 : 1;
+  const rightRank = right.projectId == null ? 0 : 1;
+  if (leftRank !== rightRank) {
+    return leftRank - rightRank;
+  }
+
+  const createdAtComparison = left.createdAt.localeCompare(right.createdAt);
+  if (createdAtComparison !== 0) {
+    return createdAtComparison;
+  }
+
+  return left.id.localeCompare(right.id);
+}
+
 function resolveValidationProfile(input: {
   profileId?: string;
   projectId?: string;
@@ -143,10 +481,11 @@ function resolveValidationProfile(input: {
   }
 
   if (input.projectId) {
+    const systemDefaultRuntimeProfileId = getAppDefaultRuntimeProfileId("task");
     const effective = resolveEffectiveRuntimeProfile({
       projectId: input.projectId,
       mode: "task",
-      systemDefaultRuntimeProfileId: null,
+      systemDefaultRuntimeProfileId,
     });
     if (!effective.profile) {
       return null;
@@ -182,26 +521,55 @@ runtimeProfilesRouter.get("/runtimes", async (c) => {
   );
 });
 
-// GET /runtime-profiles?projectId=...&includeGlobal=...&enabledOnly=...
-runtimeProfilesRouter.get("/", async (c) => {
-  const projectId = c.req.query("projectId");
-  const includeGlobal = sanitizeBooleanQuery(c.req.query("includeGlobal"), true);
-  const enabledOnly = sanitizeBooleanQuery(c.req.query("enabledOnly"), false);
+// GET /runtime-profiles?projectId=...&includeGlobal=...&enabledOnly=...&scope=...
+runtimeProfilesRouter.get("/", queryValidator(runtimeProfileListQuerySchema), async (c) => {
+  const query = c.req.valid("query");
+  const projectId = query.projectId;
+  const includeGlobal = sanitizeBooleanQuery(query.includeGlobal, true);
+  const enabledOnly = sanitizeBooleanQuery(query.enabledOnly, false);
+  const scope = query.scope ?? "visible";
 
   log.debug(
-    { projectId, includeGlobal, enabledOnly },
-    "DEBUG [runtime-profile-route] List request",
+    { projectId, includeGlobal, enabledOnly, scope },
+    "[runtime-profile-route] List request",
   );
-  const rows = listRuntimeProfiles({ projectId, includeGlobal, enabledOnly });
-  return c.json(rows.map(toRuntimeProfileResponse));
+  if (scope === "project" && !projectId) {
+    return c.json({ error: "projectId is required when scope=project" }, 400);
+  }
+
+  let profiles;
+  if (scope === "global") {
+    profiles = listRuntimeProfileResponses({ enabledOnly }).filter(
+      (profile) => profile.projectId == null,
+    );
+  } else if (scope === "project") {
+    profiles = listRuntimeProfileResponses({
+      projectId,
+      includeGlobal: false,
+      enabledOnly,
+    }).filter((profile) => profile.projectId === projectId);
+  } else {
+    profiles = listRuntimeProfileResponses({ projectId, includeGlobal, enabledOnly }).sort(
+      compareVisibleRuntimeProfiles,
+    );
+  }
+  const refreshedProfiles = await refreshProfilesWithIndexedCodexLimits(
+    profiles,
+    projectId ?? null,
+  );
+  return c.json(await enrichProfilesWithProviderIdentity(refreshedProfiles));
 });
 
 // GET /runtime-profiles/:id
 runtimeProfilesRouter.get("/:id", async (c) => {
   const { id } = c.req.param();
-  const row = findRuntimeProfileById(id);
-  if (!row) return c.json({ error: "Runtime profile not found" }, 404);
-  return c.json(toRuntimeProfileResponse(row));
+  const profile = getRuntimeProfileResponseById(id);
+  if (!profile) return c.json({ error: "Runtime profile not found" }, 404);
+  const refreshedProfile = await refreshProfileWithIndexedCodexLimit(
+    profile,
+    profile.projectId ?? null,
+  );
+  return c.json((await enrichProfilesWithProviderIdentity([refreshedProfile]))[0]);
 });
 
 // POST /runtime-profiles
@@ -232,7 +600,7 @@ runtimeProfilesRouter.post(
     if (!created) return c.json({ error: "Failed to create runtime profile" }, 500);
     log.debug(
       { profileId: created.id, runtimeId: created.runtimeId, providerId: created.providerId },
-      "DEBUG [runtime-profile-route] Created runtime profile",
+      "[runtime-profile-route] Created runtime profile",
     );
     return c.json(toRuntimeProfileResponse(created), 201);
   },
@@ -285,16 +653,23 @@ runtimeProfilesRouter.get("/effective/task/:taskId", async (c) => {
   const task = findTaskById(taskId);
   if (!task) return c.json({ error: "Task not found" }, 404);
 
+  const systemDefaultRuntimeProfileId = getAppDefaultRuntimeProfileId("task");
   const effective = resolveEffectiveRuntimeProfile({
     taskId,
     projectId: task.projectId,
     mode: "task",
-    systemDefaultRuntimeProfileId: null,
+    systemDefaultRuntimeProfileId,
   });
 
   return c.json({
     source: effective.source,
-    profile: effective.profile,
+    profile: effective.profile
+      ? (
+          await enrichProfilesWithProviderIdentity([
+            await refreshProfileWithIndexedCodexLimit(effective.profile, task.projectId),
+          ])
+        )[0]
+      : effective.profile,
     taskRuntimeProfileId: effective.taskRuntimeProfileId,
     projectRuntimeProfileId: effective.projectRuntimeProfileId,
     systemRuntimeProfileId: effective.systemRuntimeProfileId,
@@ -304,10 +679,11 @@ runtimeProfilesRouter.get("/effective/task/:taskId", async (c) => {
 // GET /runtime-profiles/effective/chat/:projectId
 runtimeProfilesRouter.get("/effective/chat/:projectId", async (c) => {
   const { projectId } = c.req.param();
+  const systemDefaultRuntimeProfileId = getAppDefaultRuntimeProfileId("chat");
   const effective = resolveEffectiveRuntimeProfile({
     projectId,
     mode: "chat",
-    systemDefaultRuntimeProfileId: null,
+    systemDefaultRuntimeProfileId,
   });
 
   const workflow = createRuntimeWorkflowSpec({
@@ -328,7 +704,13 @@ runtimeProfilesRouter.get("/effective/chat/:projectId", async (c) => {
 
   return c.json({
     source: effective.source,
-    profile: effective.profile,
+    profile: effective.profile
+      ? (
+          await enrichProfilesWithProviderIdentity([
+            await refreshProfileWithIndexedCodexLimit(effective.profile, projectId),
+          ])
+        )[0]
+      : effective.profile,
     taskRuntimeProfileId: effective.taskRuntimeProfileId,
     projectRuntimeProfileId: effective.projectRuntimeProfileId,
     systemRuntimeProfileId: effective.systemRuntimeProfileId,

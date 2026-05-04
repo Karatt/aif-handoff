@@ -18,14 +18,17 @@ import type {
   RuntimeProfile,
   CreateRuntimeProfileInput,
   UpdateRuntimeProfileInput,
+  RuntimeLimitSnapshot,
 } from "@aif/shared/browser";
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  data?: unknown;
+  constructor(message: string, status: number, data?: unknown) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.data = data;
   }
 }
 
@@ -72,6 +75,17 @@ export interface AifConfig {
   };
 }
 
+export interface AppRuntimeDefaultsResponse {
+  defaultTaskRuntimeProfileId: string | null;
+  defaultPlanRuntimeProfileId: string | null;
+  defaultReviewRuntimeProfileId: string | null;
+  defaultChatRuntimeProfileId: string | null;
+  resolvedDefaultTaskRuntimeProfileId: string | null;
+  resolvedDefaultPlanRuntimeProfileId: string | null;
+  resolvedDefaultReviewRuntimeProfileId: string | null;
+  resolvedDefaultChatRuntimeProfileId: string | null;
+}
+
 const API_PREFIX = import.meta.env.DEV ? "" : "/api";
 const API_BASE = "/tasks";
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -83,6 +97,8 @@ export interface SettingsResponse {
   useSubagents: boolean;
   maxReviewIterations: number;
   autoReviewStrategy: "full_re_review" | "closure_first";
+  usageLimitsEnabled: boolean;
+  warmupEnabled: boolean;
   runtimeReadiness: {
     availableRuntimeCount: number;
     runtimeProfileCount: number;
@@ -92,7 +108,88 @@ export interface SettingsResponse {
     modules: string[];
     openAiBaseUrlConfigured: boolean;
     codexCliPathConfigured: boolean;
+    app: AppRuntimeDefaultsResponse;
   };
+}
+
+export interface ProjectWarmupSupport {
+  supported: boolean;
+  skipReason: string | null;
+  workflowKind?: string;
+  profileMode?: string;
+  runtimeId: string | null;
+  providerId: string | null;
+  runtimeProfileId: string | null;
+  transport: string | null;
+  model: string | null;
+  selectionSource: string | null;
+}
+
+export interface ProjectWarmupSession {
+  id: string;
+  projectId: string;
+  runtimeProfileId: string | null;
+  runtimeId: string;
+  providerId: string;
+  transport: string | null;
+  model: string | null;
+  status: "creating" | "ready" | "failed" | "cleared" | "expired";
+  ttlSeconds: number;
+  expiresAt: string;
+  remainingSeconds: number;
+  summary: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectWarmupResponse {
+  enabled: boolean;
+  support: ProjectWarmupSupport;
+  targets?: ProjectWarmupSupport[];
+  warmup: ProjectWarmupSession | null;
+  warmups?: ProjectWarmupSession[];
+}
+
+export interface PartialProjectWarmupResponse {
+  enabled?: boolean;
+  support: ProjectWarmupSupport;
+  targets?: ProjectWarmupSupport[];
+  warmup: ProjectWarmupSession | null;
+  warmups?: ProjectWarmupSession[];
+  partial: true;
+  code: string;
+  error: string;
+  failedTarget?: string | null;
+}
+
+export type CreateProjectWarmupResponse = ProjectWarmupResponse | PartialProjectWarmupResponse;
+
+export interface ClearProjectWarmupResponse {
+  success: boolean;
+  cleared: number;
+}
+
+export interface SendChatMessageResponse {
+  conversationId: string;
+  sessionId: string | null;
+  assistantMessage?: string | null;
+  attachments?: ChatMessageAttachment[];
+  runtimeLimitSnapshot?: RuntimeLimitSnapshot | null;
+}
+
+interface ChatSessionRequestContext {
+  projectId?: string | null;
+  runtimeProfileId?: string | null;
+}
+
+function withChatSessionContext(path: string, context?: ChatSessionRequestContext): string {
+  if (!context) return path;
+  const qs = new URLSearchParams();
+  if (context.projectId) qs.set("projectId", context.projectId);
+  if (context.runtimeProfileId) qs.set("runtimeProfileId", context.runtimeProfileId);
+  const suffix = qs.toString();
+  return suffix ? `${path}?${suffix}` : path;
 }
 
 async function request<T>(
@@ -147,7 +244,7 @@ async function request<T>(
         message = firstFieldError[0] ?? null;
       }
     }
-    throw new ApiError(message ?? `HTTP ${res.status}`, res.status);
+    throw new ApiError(message ?? `HTTP ${res.status}`, res.status, body);
   }
 
   return res.json();
@@ -157,6 +254,24 @@ export const api = {
   getSettings(): Promise<SettingsResponse> {
     console.debug("[api] GET /settings");
     return request("/settings");
+  },
+
+  getAppRuntimeDefaults(): Promise<AppRuntimeDefaultsResponse> {
+    console.debug("[api] GET /settings/runtime-defaults");
+    return request("/settings/runtime-defaults");
+  },
+
+  updateAppRuntimeDefaults(input: {
+    defaultTaskRuntimeProfileId?: string | null;
+    defaultPlanRuntimeProfileId?: string | null;
+    defaultReviewRuntimeProfileId?: string | null;
+    defaultChatRuntimeProfileId?: string | null;
+  }): Promise<AppRuntimeDefaultsResponse> {
+    console.debug("[api] PUT /settings/runtime-defaults", input);
+    return request("/settings/runtime-defaults", {
+      method: "PUT",
+      body: JSON.stringify(input),
+    });
   },
 
   // Projects
@@ -209,6 +324,28 @@ export const api = {
   getProjectMcp(id: string): Promise<{ mcpServers: Record<string, unknown> }> {
     console.debug("[api] GET /projects/%s/mcp", id);
     return request(`/projects/${id}/mcp`);
+  },
+
+  getProjectWarmup(id: string): Promise<ProjectWarmupResponse> {
+    return request<ProjectWarmupResponse>(`/projects/${id}/warmup`);
+  },
+
+  createProjectWarmup(
+    id: string,
+    input: { ttlSeconds?: number },
+  ): Promise<CreateProjectWarmupResponse> {
+    return request<CreateProjectWarmupResponse>(
+      `/projects/${id}/warmup`,
+      {
+        method: "POST",
+        body: JSON.stringify(input),
+      },
+      PLAN_FAST_FIX_TIMEOUT_MS,
+    );
+  },
+
+  clearProjectWarmup(id: string): Promise<ClearProjectWarmupResponse> {
+    return request<ClearProjectWarmupResponse>(`/projects/${id}/warmup`, { method: "DELETE" });
   },
 
   // Tasks
@@ -377,23 +514,13 @@ export const api = {
     });
   },
 
-  sendChatMessage(input: ChatRequest): Promise<{
-    conversationId: string;
-    sessionId: string | null;
-    assistantMessage?: string | null;
-    attachments?: ChatMessageAttachment[];
-  }> {
+  sendChatMessage(input: ChatRequest): Promise<SendChatMessageResponse> {
     console.debug("[api] POST /chat", {
       projectId: input.projectId,
       explore: input.explore,
       sessionId: input.sessionId,
     });
-    return request<{
-      conversationId: string;
-      sessionId: string | null;
-      assistantMessage?: string | null;
-      attachments?: ChatMessageAttachment[];
-    }>(
+    return request<SendChatMessageResponse>(
       "/chat",
       {
         method: "POST",
@@ -401,6 +528,14 @@ export const api = {
       },
       CHAT_TIMEOUT_MS,
     );
+  },
+
+  async abortChat(conversationId: string): Promise<void> {
+    console.debug("[api] POST /chat/%s/abort", conversationId);
+    const res = await fetch(`${API_PREFIX}/chat/${conversationId}/abort`, { method: "POST" });
+    if (!res.ok && res.status !== 404) {
+      throw new Error(`Failed to abort chat: ${res.status}`);
+    }
   },
 
   // Chat Sessions
@@ -417,14 +552,19 @@ export const api = {
     });
   },
 
-  getChatSession(id: string): Promise<ChatSession> {
+  getChatSession(id: string, context?: ChatSessionRequestContext): Promise<ChatSession> {
     console.debug("[api] GET /chat/sessions/%s", id);
-    return request<ChatSession>(`/chat/sessions/${id}`);
+    return request<ChatSession>(withChatSessionContext(`/chat/sessions/${id}`, context));
   },
 
-  getChatSessionMessages(sessionId: string): Promise<ChatSessionMessage[]> {
+  getChatSessionMessages(
+    sessionId: string,
+    context?: ChatSessionRequestContext,
+  ): Promise<ChatSessionMessage[]> {
     console.debug("[api] GET /chat/sessions/%s/messages", sessionId);
-    return request<ChatSessionMessage[]>(`/chat/sessions/${sessionId}/messages`);
+    return request<ChatSessionMessage[]>(
+      withChatSessionContext(`/chat/sessions/${sessionId}/messages`, context),
+    );
   },
 
   updateChatSession(id: string, input: UpdateChatSessionInput): Promise<ChatSession> {
@@ -445,11 +585,13 @@ export const api = {
     projectId?: string;
     includeGlobal?: boolean;
     enabledOnly?: boolean;
+    scope?: "global" | "project";
   }): Promise<RuntimeProfile[]> {
     const qs = new URLSearchParams();
     if (params?.projectId) qs.set("projectId", params.projectId);
     if (params?.includeGlobal !== undefined) qs.set("includeGlobal", String(params.includeGlobal));
     if (params?.enabledOnly !== undefined) qs.set("enabledOnly", String(params.enabledOnly));
+    if (params?.scope) qs.set("scope", params.scope);
     const suffix = qs.toString() ? `?${qs.toString()}` : "";
     return request<RuntimeProfile[]>(`/runtime-profiles${suffix}`);
   },
@@ -553,5 +695,56 @@ export const api = {
     };
   }> {
     return request(`/runtime-profiles/effective/chat/${projectId}`);
+  },
+
+  // Codex login proxy (feature-flagged)
+  getCodexLoginCapabilities(): Promise<{ loginProxyEnabled: boolean }> {
+    console.debug("[api] GET /auth/codex/capabilities");
+    return request("/auth/codex/capabilities");
+  },
+
+  getCodexLoginStatus(): Promise<
+    | {
+        active: true;
+        sessionId: string;
+        verificationUrl: string;
+        userCode: string;
+        startedAt: string;
+      }
+    | {
+        active: false;
+        lastResult?: {
+          ok: boolean;
+          sessionId: string;
+          reason:
+            | "success"
+            | "exit_nonzero"
+            | "signal"
+            | "timeout"
+            | "parse_timeout"
+            | "cancel"
+            | "spawn_failed";
+          exitCode: number | null;
+          signal: string | null;
+          finishedAt: string;
+        };
+      }
+  > {
+    return request("/auth/codex/login/status");
+  },
+
+  startCodexLogin(): Promise<{
+    sessionId: string;
+    verificationUrl: string;
+    userCode: string;
+    startedAt: string;
+  }> {
+    console.debug("[api] POST /auth/codex/login/start");
+    return request("/auth/codex/login/start", { method: "POST" }, PLAN_FAST_FIX_TIMEOUT_MS);
+  },
+
+  cancelCodexLogin(): Promise<{ ok: boolean; cancelled: boolean }> {
+    console.debug("[api] POST /auth/codex/login/cancel");
+    return request("/auth/codex/login/cancel", { method: "POST" });
   },
 };

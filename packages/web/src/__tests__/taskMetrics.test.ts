@@ -39,6 +39,8 @@ function makeTask(overrides: Partial<Task>): Task {
     lastSyncedAt: null,
     sessionId: null,
     scheduledAt: null,
+    branchName: null,
+    worktreePath: null,
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
     ...overrides,

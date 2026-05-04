@@ -4,9 +4,14 @@ import { getCliSpawnInvocation } from "./helpers/cliSpawn.js";
 import { TEST_USAGE_CONTEXT } from "./helpers/usageContext.js";
 
 const spawnMock = vi.fn();
+const mockGetCodexSessionLimitSnapshot = vi.fn();
 
 vi.mock("node:child_process", () => ({
   spawn: (...args: unknown[]) => spawnMock(...args),
+}));
+
+vi.mock("../adapters/codex/sessions.js", () => ({
+  getCodexSessionLimitSnapshot: (...args: unknown[]) => mockGetCodexSessionLimitSnapshot(...args),
 }));
 
 const { runCodexCli } = await import("../adapters/codex/cli.js");
@@ -56,6 +61,8 @@ function createRunInput(overrides: Record<string, unknown> = {}) {
 describe("codex cli transport", () => {
   beforeEach(() => {
     spawnMock.mockReset();
+    mockGetCodexSessionLimitSnapshot.mockReset();
+    mockGetCodexSessionLimitSnapshot.mockResolvedValue(null);
     vi.unstubAllEnvs();
     vi.useRealTimers();
   });
@@ -93,6 +100,130 @@ describe("codex cli transport", () => {
     expect(result.outputText).toBe("plain output");
     expect(result.sessionId).toBe("session-1");
     expect(result.raw).toBe("plain output");
+  });
+
+  it("prepends execution.systemPromptAppend to stdin prompt (no --system-prompt CLI flag)", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        execution: { systemPromptAppend: "Language policy: write in Russian." },
+      }),
+    );
+
+    expect(child.stdin.write).toHaveBeenCalledWith(
+      "Language policy: write in Russian.\n\nImplement feature",
+    );
+
+    child.stdout.emit("data", "plain output");
+    child.emit("close", 0);
+
+    await runPromise;
+  });
+
+  it("prepends execution.systemPromptAppend to resume stdin prompt (resume path)", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        resume: true,
+        sessionId: "thread-resume",
+        execution: { systemPromptAppend: "Language policy: write in Russian." },
+      }),
+    );
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args.slice(0, 3)).toEqual(["exec", "resume", "thread-resume"]);
+    expect(child.stdin.write).toHaveBeenCalledWith(
+      "Language policy: write in Russian.\n\nImplement feature",
+    );
+
+    child.stdout.emit("data", "resumed output");
+    child.emit("close", 0);
+
+    await runPromise;
+  });
+
+  it("injects systemPromptAppend into custom codexCliArgs {prompt} placeholder and skips stdin", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        execution: { systemPromptAppend: "Language policy: write in Russian." },
+        options: {
+          codexCliArgs: ["run", "--json", "--prompt={prompt}"],
+        },
+      }),
+    );
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toEqual([
+      "run",
+      "--json",
+      "--prompt=Language policy: write in Russian.\n\nImplement feature",
+    ]);
+    // Prompt was embedded via {prompt} → stdin must not receive it again.
+    expect(child.stdin.write).not.toHaveBeenCalled();
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+
+    await runPromise;
+  });
+
+  it("still writes prompt to stdin on default path when the prompt collides with a generic arg token", async () => {
+    // Regression: on the default path `args` always contain generic tokens
+    // like `exec`, `--json`, or the model id. A prompt that happens to equal
+    // one of those must NOT be treated as "already embedded" — otherwise the
+    // user's prompt would never reach the CLI. Only the explicit {prompt} /
+    // --prompt placeholder signals are allowed to suppress stdin.
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(createRunInput({ prompt: "exec" }));
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toContain("exec");
+    expect(child.stdin.write).toHaveBeenCalledWith("exec");
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+    await runPromise;
+  });
+
+  it("skips stdin when {prompt} placeholder is embedded inside a composite arg", async () => {
+    // Guards against the edge case where `{prompt}` sits inside an arbitrary
+    // flag shape (e.g. `--payload=prefix {prompt} suffix`). The substitution
+    // consumes the literal `{prompt}` token, so the stdin suppressor must
+    // rely on a pre-substitution signal — otherwise the composed prompt would
+    // be delivered twice (once inside the arg, once via stdin).
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        execution: { systemPromptAppend: "Language policy: write in Russian." },
+        options: {
+          codexCliArgs: ["run", "--json", "--payload=prefix {prompt} suffix"],
+        },
+      }),
+    );
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toEqual([
+      "run",
+      "--json",
+      "--payload=prefix Language policy: write in Russian.\n\nImplement feature suffix",
+    ]);
+    expect(child.stdin.write).not.toHaveBeenCalled();
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+
+    await runPromise;
   });
 
   it("uses exec resume subcommand when resume and sessionId are set", async () => {
@@ -186,6 +317,39 @@ describe("codex cli transport", () => {
       costUsd: 0.3,
     });
     expect(result.events?.[0]?.type).toBe("stream:text");
+  });
+
+  it("expands multiple placeholders within one custom arg and suppresses stdin", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({
+        options: {
+          codexCliArgs: [
+            "run",
+            "--json",
+            "--meta={model}:{session_id}",
+            "--prompt={prompt} ({model})",
+          ],
+        },
+      }),
+    );
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toEqual([
+      "run",
+      "--json",
+      "--meta=gpt-5.4:session-1",
+      "--prompt=Implement feature (gpt-5.4)",
+    ]);
+    expect(child.stdin.write).not.toHaveBeenCalled();
+
+    child.stdout.emit("data", "ok");
+    child.emit("close", 0);
+
+    const result = await runPromise;
+    expect(result.outputText).toBe("ok");
   });
 
   it("emits -c approval_policy and -c sandbox_mode defaults when execution.bypassPermissions is true", async () => {
@@ -542,6 +706,81 @@ describe("codex cli transport", () => {
       .map((c) => c[0] as { type: string })
       .filter((e) => e.type === "system:init");
     expect(initEvents).toHaveLength(1);
+  });
+
+  it("appends a runtime:limit event when the Codex session store reports quota windows", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+    mockGetCodexSessionLimitSnapshot.mockResolvedValue({
+      source: "sdk_event",
+      status: "warning",
+      precision: "exact",
+      checkedAt: "2026-04-18T05:00:00.000Z",
+      providerId: "openai",
+      runtimeId: "codex",
+      profileId: "profile-1",
+      primaryScope: "time",
+      resetAt: "2099-04-18T10:00:00.000Z",
+      retryAfterSeconds: null,
+      warningThreshold: 10,
+      windows: [
+        {
+          scope: "time",
+          name: "5h",
+          percentUsed: 92,
+          percentRemaining: 8,
+          resetAt: "2099-04-18T10:00:00.000Z",
+          warningThreshold: 10,
+        },
+      ],
+      providerMeta: {
+        limitId: "codex",
+        limitName: null,
+        planType: "pro",
+      },
+    });
+
+    const onEvent = vi.fn();
+    const runPromise = runCodexCli(createRunInput({ execution: { onEvent } }));
+
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "thread.started",
+        thread_id: "thread-quota-1",
+      }) + "\n",
+    );
+    child.stdout.emit(
+      "data",
+      JSON.stringify({
+        type: "turn.completed",
+        usage: { input_tokens: 50, output_tokens: 10 },
+      }) + "\n",
+    );
+    child.emit("close", 0);
+
+    const result = await runPromise;
+    expect(mockGetCodexSessionLimitSnapshot).toHaveBeenCalledWith({
+      sessionId: "thread-quota-1",
+      runtimeId: "codex",
+      providerId: "openai",
+      profileId: "profile-1",
+    });
+    expect(result.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "runtime:limit",
+          message: "Runtime limit state changed: warning",
+        }),
+      ]),
+    );
+    expect(result.events?.filter((event) => event.type === "runtime:limit")).toHaveLength(1);
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "runtime:limit",
+        message: "Runtime limit state changed: warning",
+      }),
+    );
   });
 
   it("emits tool:use and calls onToolUse for command_execution items", async () => {

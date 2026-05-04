@@ -26,7 +26,16 @@ const { createClaudeRuntimeAdapter } = await import("../adapters/claude/index.js
 const { ClaudeRuntimeAdapterError } = await import("../adapters/claude/errors.js");
 
 function createRunInput(overrides: Record<string, unknown> = {}) {
-  return {
+  const overrideOptions =
+    overrides.options && typeof overrides.options === "object"
+      ? (overrides.options as Record<string, unknown>)
+      : {};
+  const overrideExecution =
+    overrides.execution && typeof overrides.execution === "object"
+      ? (overrides.execution as Record<string, unknown>)
+      : {};
+
+  const input = {
     runtimeId: "claude",
     providerId: "anthropic",
     profileId: "profile-1",
@@ -36,6 +45,8 @@ function createRunInput(overrides: Record<string, unknown> = {}) {
     cwd: "/tmp/project",
     options: {
       apiKeyEnvVar: "ANTHROPIC_API_KEY",
+      baseUrl: "https://api.anthropic.com",
+      ...overrideOptions,
     },
     execution: {
       startTimeoutMs: 10,
@@ -43,6 +54,20 @@ function createRunInput(overrides: Record<string, unknown> = {}) {
     },
     usageContext: TEST_USAGE_CONTEXT,
     ...overrides,
+  };
+
+  return {
+    ...input,
+    options: {
+      apiKeyEnvVar: "ANTHROPIC_API_KEY",
+      baseUrl: "https://api.anthropic.com",
+      ...overrideOptions,
+    },
+    execution: {
+      startTimeoutMs: 10,
+      startRetryDelayMs: 0,
+      ...overrideExecution,
+    },
   };
 }
 
@@ -242,6 +267,89 @@ describe("Claude runtime adapter", () => {
     });
   });
 
+  it("fails immediately when Claude SDK reports a blocked rate limit event", async () => {
+    queryMock.mockImplementation(async function* () {
+      yield {
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "allowed_warning",
+          overageStatus: "rejected",
+          overageResetsAt: 1_800_000_000,
+          rateLimitType: "overage",
+          utilization: 0.82,
+          isUsingOverage: true,
+        },
+      };
+      yield {
+        type: "system",
+        subtype: "init",
+        session_id: "runtime-session-after-limit",
+      };
+    });
+
+    const adapter = createClaudeRuntimeAdapter();
+
+    await expect(adapter.run(createRunInput())).rejects.toMatchObject({
+      name: "ClaudeRuntimeAdapterError",
+      category: "rate_limit",
+      adapterCode: "CLAUDE_USAGE_LIMIT",
+      resetAt: new Date(1_800_000_000 * 1000).toISOString(),
+    });
+  });
+
+  it("emits tool:use and tool:question events when SDK stream yields AskUserQuestion", async () => {
+    queryMock.mockImplementation(async function* () {
+      yield { type: "system", subtype: "init", session_id: "runtime-session-q" };
+      yield {
+        type: "assistant",
+        session_id: "runtime-session-q",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-xyz",
+              name: "AskUserQuestion",
+              input: {
+                questions: [
+                  {
+                    question: "Choose path",
+                    options: [{ label: "A" }, { label: "B" }],
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      };
+      yield {
+        type: "result",
+        subtype: "success",
+        result: "",
+        session_id: "runtime-session-q",
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+        total_cost_usd: 0,
+      };
+    });
+
+    const onEvent = vi.fn();
+    const adapter = createClaudeRuntimeAdapter();
+    await adapter.run(
+      createRunInput({
+        execution: { startTimeoutMs: 10, startRetryDelayMs: 0, onEvent },
+      }),
+    );
+
+    const events = onEvent.mock.calls.map(
+      (call) => call[0] as { type: string; data?: { toolUseId?: string; questions?: unknown[] } },
+    );
+    const toolUseEvent = events.find((e) => e.type === "tool:use");
+    const toolQuestion = events.find((e) => e.type === "tool:question");
+    expect(toolUseEvent).toBeTruthy();
+    expect(toolQuestion).toBeTruthy();
+    expect(toolQuestion?.data?.toolUseId).toBe("tool-xyz");
+    expect(toolQuestion?.data?.questions).toHaveLength(1);
+  });
+
   it("retries once when first message exceeds query_start_timeout", async () => {
     queryMock
       .mockImplementationOnce(delayedSuccess(50, "late-first"))
@@ -335,6 +443,107 @@ describe("Claude runtime adapter", () => {
     expect(events).toHaveLength(1);
     expect(events[0].message).toBe("Hello from array payload");
     expect(events[0].data).toEqual({ role: "assistant", id: "m-1" });
+  });
+
+  it("emits tool:question events for AskUserQuestion tool_use blocks in session history", async () => {
+    // Reviewer point (PR #77): runtime-only/virtual sessions must surface the
+    // question on reload. Without projecting tool_use → tool:question here, a
+    // question-only assistant turn disappears from GET /chat/sessions/:id/messages.
+    getSessionMessagesMock.mockResolvedValueOnce([
+      {
+        uuid: "m-text",
+        type: "assistant",
+        message: {
+          content: [{ type: "text", text: "Let me check the options." }],
+        },
+        createdAt: "2026-04-15T00:00:00.000Z",
+      },
+      {
+        uuid: "m-question-only",
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-ask-1",
+              name: "AskUserQuestion",
+              input: {
+                questions: [
+                  {
+                    question: "Which branch?",
+                    header: "Deploy target",
+                    options: [{ label: "main" }, { label: "dev" }],
+                  },
+                ],
+              },
+            },
+          ],
+        },
+        createdAt: "2026-04-15T00:00:01.000Z",
+      },
+      {
+        uuid: "m-mixed",
+        type: "assistant",
+        message: {
+          content: [
+            { type: "text", text: "Thinking out loud." },
+            {
+              type: "tool_use",
+              id: "tool-ask-2",
+              name: "AskUserQuestion",
+              input: {
+                questions: [{ question: "Proceed?", options: [{ label: "Yes" }] }],
+              },
+            },
+          ],
+        },
+        createdAt: "2026-04-15T00:00:02.000Z",
+      },
+      {
+        uuid: "m-other-tool",
+        type: "assistant",
+        message: {
+          content: [{ type: "tool_use", id: "t-bash", name: "Bash", input: { command: "ls" } }],
+        },
+        createdAt: "2026-04-15T00:00:03.000Z",
+      },
+    ]);
+
+    const adapter = createClaudeRuntimeAdapter();
+    const events = await adapter.listSessionEvents!({
+      runtimeId: "claude",
+      providerId: "anthropic",
+      profileId: "profile-1",
+      sessionId: "session-1",
+      projectRoot: "/tmp/project",
+    });
+
+    const toolQuestionEvents = events.filter((event) => event.type === "tool:question");
+    expect(toolQuestionEvents).toHaveLength(2);
+    expect(toolQuestionEvents[0].data).toMatchObject({
+      toolUseId: "tool-ask-1",
+      toolName: "AskUserQuestion",
+    });
+    expect(toolQuestionEvents[1].data).toMatchObject({
+      toolUseId: "tool-ask-2",
+    });
+
+    const sessionMessageEvents = events.filter((event) => event.type === "session-message");
+    expect(sessionMessageEvents.map((event) => event.message)).toEqual([
+      "Let me check the options.",
+      "Thinking out loud.",
+    ]);
+
+    const mixedIndex = events.findIndex(
+      (event) => event.type === "session-message" && event.message === "Thinking out loud.",
+    );
+    expect(mixedIndex).toBeGreaterThanOrEqual(0);
+    expect(events[mixedIndex + 1]?.type).toBe("tool:question");
+
+    // Non-question tool_use blocks (e.g. Bash) are not projected as events here —
+    // the history path only surfaces interactive questions that would otherwise
+    // be lost; activity for other tools is out of scope for chat replay.
+    expect(events.some((event) => event.type === "tool:use")).toBe(false);
   });
 
   it("returns null from getSession when sdk has no info", async () => {
@@ -624,6 +833,58 @@ describe("Claude runtime adapter", () => {
     expect(call.options.env.ANTHROPIC_API_KEY).toBe("sk-ant-test");
     expect(call.options.env.ANTHROPIC_BASE_URL).toBe("https://api.anthropic.com");
     expect(call.options.env.CUSTOM_ENV).toBe("1");
+  });
+
+  it("forwards fork mode and source session id to Claude query options", async () => {
+    queryMock.mockImplementation(immediateSuccess("forked"));
+    const adapter = createClaudeRuntimeAdapter();
+
+    const result = await adapter.forkSession!({
+      ...createRunInput({
+        model: "claude-sonnet-4-5",
+      }),
+      sourceSessionId: "session-warm-source-1",
+    });
+
+    expect(result.outputText).toBe("forked");
+    expect(result.sessionId).toBe("runtime-session-1");
+    expect(queryMock).toHaveBeenCalledTimes(1);
+    const call = queryMock.mock.calls[0][0];
+    expect(call.options.resume).toBe("session-warm-source-1");
+    expect(call.options.forkSession).toBe(true);
+    expect(call.options.model).toBe("claude-sonnet-4-5");
+  });
+
+  it("logs Claude fork lifecycle without prompt contents", async () => {
+    queryMock.mockImplementation(immediateSuccess("forked"));
+    const logger = {
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    const adapter = createClaudeRuntimeAdapter({ logger });
+
+    await adapter.forkSession!({
+      ...createRunInput({ prompt: "secret prompt text" }),
+      sourceSessionId: "session-warm-source-2",
+    });
+
+    expect(logger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceSessionIdSuffix: "source-2",
+      }),
+      "DEBUG [runtime:claude] Starting Claude session fork run",
+    );
+    expect(logger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceSessionIdSuffix: "source-2",
+        childSessionIdSuffix: "ession-1",
+      }),
+      "DEBUG [runtime:claude] Claude session fork run completed",
+    );
+    const serializedLogs = JSON.stringify(logger.debug.mock.calls);
+    expect(serializedLogs).not.toContain("secret prompt text");
   });
 
   it("forwards effort to Claude query options", async () => {

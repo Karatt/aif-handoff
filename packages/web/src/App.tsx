@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useMemo } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { Header } from "./components/layout/Header";
 import { Board } from "./components/kanban/Board";
 import { TaskDetail } from "./components/task/TaskDetail";
@@ -15,7 +15,8 @@ import { ChatPanel } from "./components/chat/ChatPanel";
 import { calculateTaskMetrics } from "./lib/taskMetrics";
 import { readStorage, writeStorage, removeStorage } from "./lib/storage";
 import { STORAGE_KEYS } from "./lib/storageKeys";
-import type { Project } from "@aif/shared/browser";
+import { api } from "./lib/api";
+import type { Project, Task } from "@aif/shared/browser";
 import { ProjectRuntimeSettings } from "./components/project/ProjectRuntimeSettings";
 import { ProjectsOverview } from "./components/project/ProjectsOverview";
 import { ToastProvider } from "./components/ui/toast";
@@ -34,7 +35,7 @@ function AppContent() {
   useCommitToasts();
   const { theme, toggleTheme } = useTheme();
   const { data: projects } = useProjects();
-  const [project, setProject] = useState<Project | null>(null);
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [commandOpen, setCommandOpen] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
@@ -47,8 +48,32 @@ function AppContent() {
     const saved = readStorage(STORAGE_KEYS.VIEW_MODE);
     return saved === "list" ? "list" : "kanban";
   });
+  const project = useMemo(
+    () => projects?.find((candidate) => candidate.id === selectedProjectId) ?? null,
+    [projects, selectedProjectId],
+  );
   const { data: projectTasks } = useTasks(project?.id ?? null);
-  const taskMetrics = useMemo(() => calculateTaskMetrics(projectTasks ?? []), [projectTasks]);
+  const { data: allTasks } = useQuery<Task[]>({
+    queryKey: ["tasks", "all"],
+    queryFn: () => api.listTasks(),
+    enabled: !project,
+  });
+  const taskMetrics = useMemo(
+    () => calculateTaskMetrics((project ? projectTasks : allTasks) ?? []),
+    [project, projectTasks, allTasks],
+  );
+  const aggregateProjectTotals = useMemo(() => {
+    if (project || !projects?.length) return null;
+    return projects.reduce(
+      (acc, p) => ({
+        tokenInput: acc.tokenInput + (p.tokenInput ?? 0),
+        tokenOutput: acc.tokenOutput + (p.tokenOutput ?? 0),
+        tokenTotal: acc.tokenTotal + (p.tokenTotal ?? 0),
+        costUsd: acc.costUsd + (p.costUsd ?? 0),
+      }),
+      { tokenInput: 0, tokenOutput: 0, tokenTotal: 0, costUsd: 0 },
+    );
+  }, [project, projects]);
 
   useEffect(() => {
     writeStorage(STORAGE_KEYS.DENSITY, density);
@@ -61,7 +86,7 @@ function AppContent() {
   // Restore state from URL or localStorage on initial load
   useEffect(() => {
     if (!projects?.length) return;
-    if (project) return;
+    if (selectedProjectId) return;
 
     const match = window.location.pathname.match(/^\/project\/([^/]+)(?:\/task\/([^/]+))?/);
     if (match) {
@@ -70,7 +95,7 @@ function AppContent() {
       const found = projects.find((p) => p.id === urlProjectId);
       if (found) {
         queueMicrotask(() => {
-          setProject(found);
+          setSelectedProjectId(found.id);
           writeStorage(STORAGE_KEYS.SELECTED_PROJECT, found.id);
           if (urlTaskId) setSelectedTaskId(urlTaskId);
         });
@@ -83,11 +108,11 @@ function AppContent() {
       const found = projects.find((p) => p.id === savedId);
       if (found) {
         queueMicrotask(() => {
-          setProject(found);
+          setSelectedProjectId(found.id);
         });
       }
     }
-  }, [projects, project]);
+  }, [projects, selectedProjectId]);
 
   // Handle browser back/forward
   useEffect(() => {
@@ -98,11 +123,12 @@ function AppContent() {
         const urlTaskId = match[2] ?? null;
         const found = projects?.find((p) => p.id === urlProjectId);
         if (found) {
-          setProject(found);
+          setSelectedProjectId(found.id);
           setSelectedTaskId(urlTaskId);
           return;
         }
       }
+      setSelectedProjectId(null);
       setSelectedTaskId(null);
     };
     window.addEventListener("popstate", onPopState);
@@ -118,7 +144,7 @@ function AppContent() {
   useKeyboardShortcut({ key: "KeyN", meta: true }, dispatchCreateTask);
 
   const handleSelectProject = useCallback((p: Project) => {
-    setProject(p);
+    setSelectedProjectId(p.id);
     setRuntimeSettingsOpen(false);
     writeStorage(STORAGE_KEYS.SELECTED_PROJECT, p.id);
     window.history.pushState(null, "", `/project/${p.id}`);
@@ -144,7 +170,7 @@ function AppContent() {
         selectedProject={project}
         onSelectProject={handleSelectProject}
         onDeselectProject={() => {
-          setProject(null);
+          setSelectedProjectId(null);
           setSelectedTaskId(null);
           setRuntimeSettingsOpen(false);
           removeStorage(STORAGE_KEYS.SELECTED_PROJECT);
@@ -156,6 +182,7 @@ function AppContent() {
         viewMode={viewMode}
         onViewModeChange={setViewMode}
         taskMetrics={taskMetrics}
+        aggregateTotals={aggregateProjectTotals}
         runtimeProfilesOpen={runtimeSettingsOpen}
         onToggleRuntimeProfiles={() => setRuntimeSettingsOpen((value) => !value)}
       />

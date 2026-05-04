@@ -25,7 +25,7 @@ export const scheduledAtSchema = z
 const taskAttachmentSchema = z.object({
   name: z.string().min(1).max(500),
   mimeType: z.string().max(200),
-  size: z.number().int().min(0).max(10_000_000),
+  size: z.number().int().min(0).max(100_000_000),
   content: z.string().max(2_000_000).nullable(),
   /** Relative path in storage/ — present for file-backed attachments */
   path: z.string().max(1000).optional(),
@@ -49,7 +49,7 @@ export const createTaskSchema = z.object({
   projectId: z.string().min(1, "Project ID is required"),
   title: z.string().min(1, "Title is required").max(500),
   description: z.string().default(""),
-  attachments: z.array(taskAttachmentSchema).max(10).default([]),
+  attachments: z.array(taskAttachmentSchema).max(100).default([]),
   priority: z.number().int().min(0).max(5).default(0),
   autoMode: z.boolean().default(true),
   isFix: z.boolean().default(false),
@@ -77,7 +77,7 @@ export const createTaskSchema = z.object({
 export const updateTaskSchema = z.object({
   title: z.string().min(1).max(500).optional(),
   description: z.string().optional(),
-  attachments: z.array(taskAttachmentSchema).max(10).optional(),
+  attachments: z.array(taskAttachmentSchema).max(100).optional(),
   priority: z.number().int().min(0).max(5).optional(),
   autoMode: z.boolean().optional(),
   isFix: z.boolean().optional(),
@@ -115,7 +115,7 @@ export const taskEventSchema = z.object({
 
 export const createTaskCommentSchema = z.object({
   message: z.string().min(1, "Comment message is required").max(20_000),
-  attachments: z.array(taskAttachmentSchema).max(10).default([]),
+  attachments: z.array(taskAttachmentSchema).max(100).default([]),
 });
 
 export const reorderTaskSchema = z.object({
@@ -133,8 +133,13 @@ export const autoQueueModeSchema = z.object({
 });
 
 export const broadcastProjectSchema = z.object({
-  type: z.enum(["project:auto_queue_mode_changed", "project:auto_queue_advanced"]),
-  taskId: z.string().uuid().optional(),
+  type: z.enum([
+    "project:auto_queue_mode_changed",
+    "project:auto_queue_advanced",
+    "project:runtime_limit_updated",
+  ]),
+  taskId: z.string().min(1).optional(),
+  runtimeProfileId: z.string().min(1).nullable().optional(),
 });
 
 export const roadmapImportSchema = z.object({
@@ -144,6 +149,10 @@ export const roadmapImportSchema = z.object({
 export const roadmapGenerateSchema = z.object({
   roadmapAlias: z.string().min(1, "Roadmap alias is required").max(200),
   vision: z.string().max(10000).optional(),
+});
+
+export const warmupCreateSchema = z.object({
+  ttlSeconds: z.number().int().min(60).max(86_400).default(3_600),
 });
 
 export const createChatSessionSchema = z.object({
@@ -159,10 +168,21 @@ export const updateChatSessionSchema = z.object({
   runtimeSessionId: z.string().min(1).nullable().optional(),
 });
 
+export const updateAppRuntimeDefaultsSchema = z
+  .object({
+    defaultTaskRuntimeProfileId: z.string().min(1).nullable().optional(),
+    defaultPlanRuntimeProfileId: z.string().min(1).nullable().optional(),
+    defaultReviewRuntimeProfileId: z.string().min(1).nullable().optional(),
+    defaultChatRuntimeProfileId: z.string().min(1).nullable().optional(),
+  })
+  .refine((payload) => Object.keys(payload).length > 0, {
+    message: "At least one field is required",
+  });
+
 export const chatAttachmentSchema = z.object({
   name: z.string().min(1).max(500),
   mimeType: z.string().max(200),
-  size: z.number().int().min(0).max(10_000_000),
+  size: z.number().int().min(0).max(100_000_000),
   content: z.string().max(2_000_000).nullable(),
 });
 
@@ -175,7 +195,7 @@ export const chatRequestSchema = z.object({
   explore: z.boolean().default(false),
   taskId: z.string().optional(),
   runtimeProfileId: z.string().min(1).nullable().optional(),
-  attachments: z.array(chatAttachmentSchema).max(5).optional(),
+  attachments: z.array(chatAttachmentSchema).max(100).optional(),
 });
 
 const runtimeHeadersSchema = z.record(z.string(), z.string());
@@ -231,4 +251,11 @@ export const runtimeProfileModelsSchema = z.object({
   runtimeOptions: runtimeOptionsSchema.nullable().optional(),
   apiKey: z.string().min(1).optional(),
   forceRefresh: z.boolean().optional(),
+});
+
+export const runtimeProfileListQuerySchema = z.object({
+  projectId: z.string().min(1).optional(),
+  includeGlobal: z.string().optional(),
+  enabledOnly: z.string().optional(),
+  scope: z.enum(["global", "project", "visible"]).optional(),
 });

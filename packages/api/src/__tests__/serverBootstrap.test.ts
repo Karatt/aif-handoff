@@ -37,6 +37,7 @@ describe("startServer", () => {
     const server = new FakeServer();
     const logger = createLogger();
     const injectWebSocket = vi.fn();
+    const onStarted = vi.fn();
 
     createAdaptorServerMock.mockReturnValue(server);
 
@@ -46,6 +47,7 @@ describe("startServer", () => {
       fetch: vi.fn(),
       port: 3009,
       injectWebSocket,
+      onStarted,
       logger,
     });
 
@@ -65,9 +67,10 @@ describe("startServer", () => {
       { hostname: undefined, port: 3009 },
       "API server started",
     );
+    expect(onStarted).toHaveBeenCalledTimes(1);
   });
 
-  it("logs an actionable [FIX] message when the port is already in use", async () => {
+  it("logs an actionable error message when the port is already in use", async () => {
     const server = new FakeServer();
     const logger = createLogger();
     const error = Object.assign(new Error("listen EADDRINUSE"), {
@@ -94,7 +97,7 @@ describe("startServer", () => {
 
     expect(logger.error).toHaveBeenCalledWith(
       { error, hostname: undefined, port: 3009, startupPhase: "before-ready" },
-      "[FIX] Failed to start API server: port 3009 is already in use. Stop the existing process or set PORT to a different value.",
+      "Failed to start API server: port 3009 is already in use. Stop the existing process or set PORT to a different value.",
     );
     expect(process.exitCode).toBe(1);
   });
@@ -133,7 +136,7 @@ describe("startServer", () => {
     );
     expect(logger.error).toHaveBeenCalledWith(
       { error: runtimeError, hostname: undefined, port: 3009, startupPhase: "after-ready" },
-      "[FIX] API server error.",
+      "API server error.",
     );
     expect(process.exitCode).toBeUndefined();
   });

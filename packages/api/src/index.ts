@@ -1,17 +1,19 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { logger, getEnv } from "@aif/shared";
-import { listProjects, listRuntimeProfiles, listStaleInProgressTasks } from "@aif/data";
+import { getEnv, logger } from "@aif/shared";
+import { listProjects, listStaleInProgressTasks } from "@aif/data";
 import { projectsRouter } from "./routes/projects.js";
 import { tasksRouter } from "./routes/tasks.js";
 import { chatRouter } from "./routes/chat.js";
-import { settingsRoutes } from "./routes/settings.js";
+import { buildSettingsOverview, settingsRoutes } from "./routes/settings.js";
 import { runtimeProfilesRouter } from "./routes/runtimeProfiles.js";
-import { docsRouter } from "./routes/docs.js";
-import { setupWebSocket } from "./ws.js";
+import { codexAuthRouter } from "./routes/codexAuth.js";
+import { setupWebSocket, closeAllWebSocketClients } from "./ws.js";
 import { requestLogger } from "./middleware/logger.js";
-import { getApiRuntimeRegistry } from "./services/runtime.js";
+import { trackApiLoad } from "./middleware/apiLoad.js";
 import { startServer } from "./serverBootstrap.js";
+import { createCodexIndexService } from "./services/codexIndex.js";
+import { createGracefulShutdownHandler } from "./shutdown.js";
 
 const log = logger("server");
 const startTime = Date.now();
@@ -28,6 +30,7 @@ app.use(
     origin: process.env.CORS_ORIGIN || "http://localhost:5180",
   }),
 );
+app.use("*", trackApiLoad);
 app.use("*", requestLogger);
 
 // Health check
@@ -67,48 +70,8 @@ app.get("/agent/status", (c) => {
 });
 
 // Settings (expose env defaults to frontend)
-app.get("/settings", (c) => {
-  const env = getEnv();
-  return getApiRuntimeRegistry()
-    .then((registry) => {
-      const runtimeProfiles = listRuntimeProfiles();
-      const enabledProfiles = runtimeProfiles.filter((profile) => profile.enabled);
-      return c.json({
-        useSubagents: env.AGENT_USE_SUBAGENTS,
-        maxReviewIterations: env.AGENT_MAX_REVIEW_ITERATIONS,
-        autoReviewStrategy: env.AGENT_AUTO_REVIEW_STRATEGY,
-        runtimeReadiness: {
-          availableRuntimeCount: registry.listRuntimes().length,
-          runtimeProfileCount: runtimeProfiles.length,
-          enabledRuntimeProfileCount: enabledProfiles.length,
-        },
-        runtimeDefaults: {
-          modules: env.AIF_RUNTIME_MODULES,
-          openAiBaseUrlConfigured: Boolean(env.OPENAI_BASE_URL),
-          codexCliPathConfigured: Boolean(env.CODEX_CLI_PATH),
-        },
-      });
-    })
-    .catch((error) => {
-      log.error({ error }, "Failed to include runtime settings payload");
-      const allProfiles = listRuntimeProfiles();
-      const enabledProfiles = listRuntimeProfiles({ enabledOnly: true });
-      return c.json({
-        useSubagents: env.AGENT_USE_SUBAGENTS,
-        maxReviewIterations: env.AGENT_MAX_REVIEW_ITERATIONS,
-        autoReviewStrategy: env.AGENT_AUTO_REVIEW_STRATEGY,
-        runtimeReadiness: {
-          availableRuntimeCount: 0,
-          runtimeProfileCount: allProfiles.length,
-          enabledRuntimeProfileCount: enabledProfiles.length,
-        },
-        runtimeDefaults: {
-          modules: env.AIF_RUNTIME_MODULES,
-          openAiBaseUrlConfigured: Boolean(env.OPENAI_BASE_URL),
-          codexCliPathConfigured: Boolean(env.CODEX_CLI_PATH),
-        },
-      });
-    });
+app.get("/settings", async (c) => {
+  return c.json(await buildSettingsOverview());
 });
 
 // Routes
@@ -117,19 +80,61 @@ app.route("/tasks", tasksRouter);
 app.route("/chat", chatRouter);
 app.route("/settings", settingsRoutes);
 app.route("/runtime-profiles", runtimeProfilesRouter);
-app.route("/docs", docsRouter);
+
+// Codex OAuth login proxy (feature-flagged; see AIF_ENABLE_CODEX_LOGIN_PROXY).
+// The /auth/codex/capabilities endpoint is always registered so the frontend can
+// discover whether the feature is available; the mutating endpoints register only
+// when the flag is true.
+if (getEnv().AIF_ENABLE_CODEX_LOGIN_PROXY) {
+  log.info("Codex login proxy enabled - mounting /auth/codex routes");
+  app.route("/auth/codex", codexAuthRouter);
+} else {
+  log.debug("Codex login proxy disabled - mounting capabilities endpoint only");
+  const disabledRouter = new Hono();
+  disabledRouter.get("/capabilities", (c) => c.json({ loginProxyEnabled: false }));
+  app.route("/auth/codex", disabledRouter);
+}
 
 // Initialize DB and start server
 const port = Number(process.env.PORT) || 3009;
 
 // Ensure data layer / DB is ready
 listProjects();
+const codexIndexService = createCodexIndexService();
 
 const server = startServer({
   fetch: app.fetch,
   port,
   injectWebSocket,
+  onStarted() {
+    void codexIndexService.start();
+  },
   logger: log,
+});
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown: stop the Codex indexer, close HTTP server, and terminate
+// WS clients so Ctrl+C / tsx-watch reload frees port 3009 without a second
+// signal. Without this the open WS connections keep the event loop alive and
+// the next restart hits EADDRINUSE.
+// ---------------------------------------------------------------------------
+const onShutdown = createGracefulShutdownHandler({
+  logger: log,
+  stopCodexIndex: () => codexIndexService.stop(),
+  closeWebSockets: closeAllWebSocketClients,
+  closeServer: () => {
+    server.close();
+  },
+  exitProcess: (code) => {
+    process.exit(code);
+  },
+});
+
+process.on("SIGINT", () => {
+  void onShutdown("SIGINT");
+});
+process.on("SIGTERM", () => {
+  void onShutdown("SIGTERM");
 });
 
 export { app, server };

@@ -16,6 +16,15 @@ import {
   type CommentRow,
   updateTask,
 } from "@aif/data";
+import type { TaskStatus } from "@aif/shared";
+
+export function toTaskBroadcastPayload(task: { id: string; title: string; status: TaskStatus }) {
+  return {
+    id: task.id,
+    title: task.title,
+    status: task.status,
+  };
+}
 
 export function updateTaskPlan(
   taskId: string,
@@ -25,11 +34,13 @@ export function updateTaskPlan(
 ): void {
   const project = findProjectByTaskId(taskId);
   if (!project) throw new Error("Project not found for task");
+  const task = findTaskById(taskId);
+  const executionRoot = task?.worktreePath ?? project.rootPath;
 
   persistTaskPlanForTask({
     taskId,
     planText,
-    projectRoot: project.rootPath,
+    projectRoot: executionRoot,
     isFix,
     planPath,
     updatedAt: new Date().toISOString(),
@@ -42,9 +53,10 @@ export function getTaskPlanFileStatus(taskId: string) {
 
   const project = findProjectByTaskId(taskId);
   if (!project) return null;
+  const executionRoot = task.worktreePath ?? project.rootPath;
 
   const canonicalPlanPath = getCanonicalPlanPath({
-    projectRoot: project.rootPath,
+    projectRoot: executionRoot,
     isFix: task.isFix,
     planPath: task.planPath,
   });
@@ -61,9 +73,10 @@ export function syncTaskPlanFromFile(taskId: string): { synced: boolean } | null
 
   const project = findProjectByTaskId(taskId);
   if (!project) return null;
+  const executionRoot = task.worktreePath ?? project.rootPath;
 
   const canonicalPlanPath = getCanonicalPlanPath({
-    projectRoot: project.rootPath,
+    projectRoot: executionRoot,
     isFix: task.isFix,
     planPath: task.planPath,
   });
@@ -77,7 +90,7 @@ export function syncTaskPlanFromFile(taskId: string): { synced: boolean } | null
   persistTaskPlanForTask({
     taskId,
     planText: normalizedPlan,
-    projectRoot: project.rootPath,
+    projectRoot: executionRoot,
     isFix: task.isFix,
     planPath: task.planPath,
     updatedAt: new Date().toISOString(),

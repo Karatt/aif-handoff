@@ -59,6 +59,17 @@ function ensureTables(sqlite: Database.Database): void {
     )
   `);
   sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      id INTEGER PRIMARY KEY NOT NULL DEFAULT 1,
+      default_task_runtime_profile_id TEXT,
+      default_plan_runtime_profile_id TEXT,
+      default_review_runtime_profile_id TEXT,
+      default_chat_runtime_profile_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    )
+  `);
+  sqlite.exec(`
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL,
@@ -72,7 +83,7 @@ function ensureTables(sqlite: Database.Database): void {
       plan_docs INTEGER NOT NULL DEFAULT 0,
       plan_tests INTEGER NOT NULL DEFAULT 0,
       skip_review INTEGER NOT NULL DEFAULT 0,
-      use_subagents INTEGER NOT NULL DEFAULT 1,
+      use_subagents INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'backlog',
       priority INTEGER NOT NULL DEFAULT 0,
       position REAL NOT NULL DEFAULT 1000.0,
@@ -102,9 +113,13 @@ function ensureTables(sqlite: Database.Database): void {
       model_override TEXT,
       runtime_options_json TEXT,
       session_id TEXT,
+      runtime_limit_snapshot_json TEXT,
+      runtime_limit_updated_at TEXT,
       locked_by TEXT,
       locked_until TEXT,
       scheduled_at TEXT,
+      branch_name TEXT,
+      worktree_path TEXT,
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
       updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     )
@@ -133,6 +148,8 @@ function ensureTables(sqlite: Database.Database): void {
       headers_json TEXT NOT NULL DEFAULT '{}',
       options_json TEXT NOT NULL DEFAULT '{}',
       enabled INTEGER NOT NULL DEFAULT 1,
+      runtime_limit_snapshot_json TEXT,
+      runtime_limit_updated_at TEXT,
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
       updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     )
@@ -177,6 +194,97 @@ function ensureTables(sqlite: Database.Database): void {
       total_tokens INTEGER NOT NULL DEFAULT 0,
       cost_usd REAL,
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    )
+  `);
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS runtime_warmup_sessions (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      runtime_profile_id TEXT,
+      runtime_id TEXT NOT NULL,
+      provider_id TEXT NOT NULL,
+      transport TEXT,
+      model TEXT,
+      source_session_id TEXT,
+      status TEXT NOT NULL DEFAULT 'creating',
+      ttl_seconds INTEGER NOT NULL,
+      expires_at TEXT NOT NULL,
+      summary TEXT,
+      error_message TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    )
+  `);
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS codex_sessions (
+      session_id TEXT PRIMARY KEY,
+      file_path TEXT NOT NULL UNIQUE,
+      title TEXT,
+      project_root TEXT,
+      account_fingerprint TEXT,
+      source_created_at TEXT,
+      source_updated_at TEXT,
+      message_count INTEGER NOT NULL DEFAULT 0,
+      preview_text TEXT,
+      size_bytes INTEGER NOT NULL DEFAULT 0,
+      mtime_ms INTEGER NOT NULL DEFAULT 0,
+      last_indexed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    )
+  `);
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS codex_session_files (
+      file_path TEXT PRIMARY KEY,
+      session_id TEXT,
+      size_bytes INTEGER NOT NULL DEFAULT 0,
+      mtime_ms INTEGER NOT NULL DEFAULT 0,
+      parsed_offset INTEGER NOT NULL DEFAULT 0,
+      pending_tail TEXT NOT NULL DEFAULT '',
+      missing INTEGER NOT NULL DEFAULT 0,
+      import_version INTEGER NOT NULL DEFAULT 1,
+      last_seen_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    )
+  `);
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS codex_limit_heads (
+      head_key TEXT PRIMARY KEY,
+      account_fingerprint TEXT NOT NULL,
+      project_root TEXT,
+      limit_id TEXT NOT NULL,
+      model TEXT,
+      source TEXT NOT NULL DEFAULT 'codex',
+      snapshot_json TEXT NOT NULL,
+      observed_at TEXT NOT NULL,
+      session_id TEXT,
+      file_path TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    )
+  `);
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS codex_limit_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      head_key TEXT NOT NULL,
+      account_fingerprint TEXT NOT NULL,
+      project_root TEXT,
+      limit_id TEXT NOT NULL,
+      model TEXT,
+      snapshot_json TEXT NOT NULL,
+      observed_at TEXT NOT NULL,
+      session_id TEXT,
+      file_path TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    )
+  `);
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS codex_index_cursors (
+      cursor_key TEXT PRIMARY KEY,
+      cursor_value TEXT,
+      cursor_json TEXT,
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     )
   `);
 
@@ -401,6 +509,193 @@ const MIGRATIONS: Migration[] = [
       ALTER TABLE projects ADD COLUMN auto_queue_mode INTEGER NOT NULL DEFAULT 0;
     `,
   },
+  {
+    version: 13,
+    description: "Persist runtime limit snapshots on runtime_profiles and tasks",
+    sql: `
+      ALTER TABLE runtime_profiles ADD COLUMN runtime_limit_snapshot_json TEXT;
+      ALTER TABLE runtime_profiles ADD COLUMN runtime_limit_updated_at TEXT;
+      ALTER TABLE tasks ADD COLUMN runtime_limit_snapshot_json TEXT;
+      ALTER TABLE tasks ADD COLUMN runtime_limit_updated_at TEXT;
+    `,
+  },
+  {
+    version: 14,
+    description: "Add app_settings singleton table and extend runtime-profile cleanup coverage",
+    sql: `
+      CREATE TABLE IF NOT EXISTS app_settings (
+        id INTEGER PRIMARY KEY NOT NULL DEFAULT 1,
+        default_task_runtime_profile_id TEXT,
+        default_plan_runtime_profile_id TEXT,
+        default_review_runtime_profile_id TEXT,
+        default_chat_runtime_profile_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+      INSERT OR IGNORE INTO app_settings (id) VALUES (1);
+      DROP TRIGGER IF EXISTS trg_runtime_profiles_delete;
+    `,
+    triggers: [
+      `CREATE TRIGGER IF NOT EXISTS trg_runtime_profiles_delete
+       AFTER DELETE ON runtime_profiles
+       FOR EACH ROW
+       BEGIN
+         UPDATE tasks SET runtime_profile_id = NULL WHERE runtime_profile_id = OLD.id;
+         UPDATE projects SET default_task_runtime_profile_id = NULL WHERE default_task_runtime_profile_id = OLD.id;
+         UPDATE projects SET default_plan_runtime_profile_id = NULL WHERE default_plan_runtime_profile_id = OLD.id;
+         UPDATE projects SET default_review_runtime_profile_id = NULL WHERE default_review_runtime_profile_id = OLD.id;
+         UPDATE projects SET default_chat_runtime_profile_id = NULL WHERE default_chat_runtime_profile_id = OLD.id;
+         UPDATE chat_sessions SET runtime_profile_id = NULL WHERE runtime_profile_id = OLD.id;
+         UPDATE app_settings
+         SET
+           default_task_runtime_profile_id = CASE
+             WHEN default_task_runtime_profile_id = OLD.id THEN NULL
+             ELSE default_task_runtime_profile_id
+           END,
+           default_plan_runtime_profile_id = CASE
+             WHEN default_plan_runtime_profile_id = OLD.id THEN NULL
+             ELSE default_plan_runtime_profile_id
+           END,
+           default_review_runtime_profile_id = CASE
+             WHEN default_review_runtime_profile_id = OLD.id THEN NULL
+             ELSE default_review_runtime_profile_id
+           END,
+           default_chat_runtime_profile_id = CASE
+             WHEN default_chat_runtime_profile_id = OLD.id THEN NULL
+             ELSE default_chat_runtime_profile_id
+           END,
+           updated_at = CASE
+             WHEN default_task_runtime_profile_id = OLD.id
+               OR default_plan_runtime_profile_id = OLD.id
+               OR default_review_runtime_profile_id = OLD.id
+               OR default_chat_runtime_profile_id = OLD.id
+             THEN (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ELSE updated_at
+           END
+         WHERE id = 1;
+       END`,
+    ],
+  },
+  {
+    version: 15,
+    description:
+      "Re-apply runtime limit snapshot columns for DBs that skipped v13 due to branch-merge re-ordering",
+    sql: `
+      ALTER TABLE runtime_profiles ADD COLUMN runtime_limit_snapshot_json TEXT;
+      ALTER TABLE runtime_profiles ADD COLUMN runtime_limit_updated_at TEXT;
+      ALTER TABLE tasks ADD COLUMN runtime_limit_snapshot_json TEXT;
+      ALTER TABLE tasks ADD COLUMN runtime_limit_updated_at TEXT;
+    `,
+  },
+  {
+    version: 17,
+    description: "Add Codex index read-model tables for session and usage-limit overlays",
+    sql: `
+      CREATE TABLE IF NOT EXISTS codex_sessions (
+        session_id TEXT PRIMARY KEY,
+        file_path TEXT NOT NULL UNIQUE,
+        title TEXT,
+        project_root TEXT,
+        account_fingerprint TEXT,
+        source_created_at TEXT,
+        source_updated_at TEXT,
+        message_count INTEGER NOT NULL DEFAULT 0,
+        preview_text TEXT,
+        size_bytes INTEGER NOT NULL DEFAULT 0,
+        mtime_ms INTEGER NOT NULL DEFAULT 0,
+        last_indexed_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+      CREATE TABLE IF NOT EXISTS codex_session_files (
+        file_path TEXT PRIMARY KEY,
+        session_id TEXT,
+        size_bytes INTEGER NOT NULL DEFAULT 0,
+        mtime_ms INTEGER NOT NULL DEFAULT 0,
+        parsed_offset INTEGER NOT NULL DEFAULT 0,
+        pending_tail TEXT NOT NULL DEFAULT '',
+        missing INTEGER NOT NULL DEFAULT 0,
+        import_version INTEGER NOT NULL DEFAULT 1,
+        last_seen_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+      CREATE TABLE IF NOT EXISTS codex_limit_heads (
+        head_key TEXT PRIMARY KEY,
+        account_fingerprint TEXT NOT NULL,
+        project_root TEXT,
+        limit_id TEXT NOT NULL,
+        model TEXT,
+        source TEXT NOT NULL DEFAULT 'codex',
+        snapshot_json TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        session_id TEXT,
+        file_path TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+      CREATE TABLE IF NOT EXISTS codex_limit_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        head_key TEXT NOT NULL,
+        account_fingerprint TEXT NOT NULL,
+        project_root TEXT,
+        limit_id TEXT NOT NULL,
+        model TEXT,
+        snapshot_json TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        session_id TEXT,
+        file_path TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+      CREATE TABLE IF NOT EXISTS codex_index_cursors (
+        cursor_key TEXT PRIMARY KEY,
+        cursor_value TEXT,
+        cursor_json TEXT,
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+    `,
+  },
+  {
+    version: 18,
+    description: "Drop unused Codex session-file dirty-scan index",
+    sql: `
+      DROP INDEX IF EXISTS idx_codex_session_files_dirty;
+    `,
+  },
+  {
+    version: 19,
+    description:
+      "Persist feature branch name per task so HANDOFF_MODE auto-queue can route implementer back to the right branch",
+    sql: "ALTER TABLE tasks ADD COLUMN branch_name TEXT",
+  },
+  {
+    version: 20,
+    description: "Persist per-task git worktree path for parallel auto-queue isolation",
+    sql: "ALTER TABLE tasks ADD COLUMN worktree_path TEXT",
+  },
+  {
+    version: 21,
+    description: "Add runtime warmup session persistence",
+    sql: `
+      CREATE TABLE IF NOT EXISTS runtime_warmup_sessions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        runtime_profile_id TEXT,
+        runtime_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,
+        transport TEXT,
+        model TEXT,
+        source_session_id TEXT,
+        status TEXT NOT NULL DEFAULT 'creating',
+        ttl_seconds INTEGER NOT NULL,
+        expires_at TEXT NOT NULL,
+        summary TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+    `,
+  },
 ];
 
 function splitSqlStatements(sqlText: string): string[] {
@@ -478,6 +773,21 @@ function hasColumn(sqlite: Database.Database, tableName: string, columnName: str
 }
 
 function runRuntimeBackfills(sqlite: Database.Database): void {
+  if (hasColumn(sqlite, "app_settings", "id")) {
+    const appSettingsBackfill = sqlite
+      .prepare(
+        `
+        INSERT OR IGNORE INTO app_settings (id)
+        VALUES (1)
+      `,
+      )
+      .run();
+    log.info(
+      { backfilledRows: appSettingsBackfill.changes },
+      "Backfilled singleton app_settings row",
+    );
+  }
+
   if (hasColumn(sqlite, "chat_sessions", "runtime_session_id")) {
     const sessionBackfill = sqlite
       .prepare(
@@ -558,6 +868,40 @@ function runRuntimeBackfills(sqlite: Database.Database): void {
       "Backfilled task manual_review_required defaults",
     );
   }
+
+  if (hasColumn(sqlite, "runtime_profiles", "runtime_limit_snapshot_json")) {
+    const runtimeProfileLimitBackfill = sqlite
+      .prepare(
+        `
+        UPDATE runtime_profiles
+        SET runtime_limit_snapshot_json = NULL
+        WHERE runtime_limit_snapshot_json IS NOT NULL
+          AND trim(runtime_limit_snapshot_json) = ''
+      `,
+      )
+      .run();
+    log.info(
+      { backfilledRows: runtimeProfileLimitBackfill.changes },
+      "Backfilled runtime profile empty runtime_limit_snapshot_json values",
+    );
+  }
+
+  if (hasColumn(sqlite, "tasks", "runtime_limit_snapshot_json")) {
+    const taskLimitBackfill = sqlite
+      .prepare(
+        `
+        UPDATE tasks
+        SET runtime_limit_snapshot_json = NULL
+        WHERE runtime_limit_snapshot_json IS NOT NULL
+          AND trim(runtime_limit_snapshot_json) = ''
+      `,
+      )
+      .run();
+    log.info(
+      { backfilledRows: taskLimitBackfill.changes },
+      "Backfilled task empty runtime_limit_snapshot_json values",
+    );
+  }
 }
 
 /** Idempotent trigger bootstrap — ensures cascade cleanup triggers exist on every startup. */
@@ -609,6 +953,18 @@ function ensureIndexes(sqlite: Database.Database): void {
     "CREATE INDEX IF NOT EXISTS idx_usage_events_chat_session ON usage_events(chat_session_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_source ON usage_events(source, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_runtime ON usage_events(runtime_id, provider_id, created_at)",
+    // Runtime warmup lookup and lifecycle scans.
+    "CREATE INDEX IF NOT EXISTS idx_runtime_warmup_active_lookup ON runtime_warmup_sessions(project_id, runtime_profile_id, runtime_id, provider_id, transport, model, status, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_runtime_warmup_expires ON runtime_warmup_sessions(status, expires_at)",
+    // Codex index: project session listing and session detail lookup.
+    "CREATE INDEX IF NOT EXISTS idx_codex_sessions_project_root_updated ON codex_sessions(project_root, source_updated_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_codex_sessions_file_path ON codex_sessions(file_path)",
+    // Codex file-state reconcile scans.
+    "CREATE INDEX IF NOT EXISTS idx_codex_session_files_session_id ON codex_session_files(session_id)",
+    // Codex latest-head and bounded-history lookups.
+    "CREATE INDEX IF NOT EXISTS idx_codex_limit_heads_lookup ON codex_limit_heads(account_fingerprint, project_root, limit_id, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_codex_limit_history_head ON codex_limit_history(head_key, observed_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_codex_limit_history_account ON codex_limit_history(account_fingerprint, project_root, limit_id, observed_at DESC)",
   ];
 
   for (const ddl of indexDefs) {

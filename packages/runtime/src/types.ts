@@ -1,7 +1,16 @@
 import {
   isRuntimeTransport as _isRuntimeTransport,
   RUNTIME_TRANSPORTS as _RUNTIME_TRANSPORTS,
+  RuntimeLimitPrecision as _RuntimeLimitPrecision,
+  RuntimeLimitScope as _RuntimeLimitScope,
+  RuntimeLimitSource as _RuntimeLimitSource,
+  RuntimeLimitStatus as _RuntimeLimitStatus,
   RuntimeTransport as _RuntimeTransport,
+} from "@aif/shared";
+import type {
+  RuntimeLimitEventPayload as _RuntimeLimitEventPayload,
+  RuntimeLimitSnapshot as _RuntimeLimitSnapshot,
+  RuntimeLimitWindow as _RuntimeLimitWindow,
 } from "@aif/shared";
 
 // Re-exported from @aif/shared — single source of truth for browser + server
@@ -9,6 +18,21 @@ export const RuntimeTransport = _RuntimeTransport;
 export type RuntimeTransport = (typeof RuntimeTransport)[keyof typeof RuntimeTransport];
 export const RUNTIME_TRANSPORTS = _RUNTIME_TRANSPORTS;
 export const isRuntimeTransport = _isRuntimeTransport;
+export const RuntimeLimitSource = _RuntimeLimitSource;
+export type RuntimeLimitSource = (typeof RuntimeLimitSource)[keyof typeof RuntimeLimitSource];
+export const RuntimeLimitStatus = _RuntimeLimitStatus;
+export type RuntimeLimitStatus = (typeof RuntimeLimitStatus)[keyof typeof RuntimeLimitStatus];
+export const RuntimeLimitPrecision = _RuntimeLimitPrecision;
+export type RuntimeLimitPrecision =
+  (typeof RuntimeLimitPrecision)[keyof typeof RuntimeLimitPrecision];
+export const RuntimeLimitScope = _RuntimeLimitScope;
+export type RuntimeLimitScope = (typeof RuntimeLimitScope)[keyof typeof RuntimeLimitScope];
+export type RuntimeLimitWindow = _RuntimeLimitWindow;
+export type RuntimeLimitSnapshot = _RuntimeLimitSnapshot;
+export type RuntimeLimitEventPayload = _RuntimeLimitEventPayload;
+
+/** Canonical runtime event type for provider limit-state updates. */
+export const RUNTIME_LIMIT_EVENT_TYPE = "runtime:limit" as const;
 
 /**
  * Usage reporting contract — declares whether an adapter can populate
@@ -54,6 +78,8 @@ export const UsageSource = {
   ROADMAP_EXTRACT: "roadmap-extract",
   /** Fast Fix on a task (services/fastFix.ts). */
   FAST_FIX: "fast-fix",
+  /** Reusable seed session creation for project warmup flows. */
+  WARMUP: "warmup",
   /** Subagent execution from the agent coordinator (agent/subagentQuery.ts). */
   SUBAGENT: "subagent",
   /** Adapter-internal probe used by listModels() discovery flows. */
@@ -71,6 +97,8 @@ export type UsageSource = (typeof UsageSource)[keyof typeof UsageSource];
 export interface RuntimeCapabilities {
   /** Adapter can continue a previous session via resume(). */
   supportsResume: boolean;
+  /** Adapter can fork a source session into a child session before running a prompt. */
+  supportsSessionFork: boolean;
   /** Adapter can list/get sessions via listSessions(), getSession(), listSessionEvents(). */
   supportsSessionList: boolean;
   /** Adapter supports .claude/agents/ definitions (agentDefinitionName in execution intent). */
@@ -89,10 +117,18 @@ export interface RuntimeCapabilities {
    * on `RuntimeRunResult.usage`.
    */
   usageReporting: UsageReporting;
+  /**
+   * Adapter emits interactive `tool:question` events (e.g. Claude's
+   * `AskUserQuestion`). Consumers use this flag to gate provider-specific
+   * prompt hints and UI affordances so other runtimes don't inherit noise.
+   * Optional — defaults to false for adapters that don't declare it.
+   */
+  supportsInteractiveQuestions?: boolean;
 }
 
 export const DEFAULT_RUNTIME_CAPABILITIES: RuntimeCapabilities = {
   supportsResume: false,
+  supportsSessionFork: false,
   supportsSessionList: false,
   supportsAgentDefinitions: false,
   supportsStreaming: false,
@@ -100,6 +136,7 @@ export const DEFAULT_RUNTIME_CAPABILITIES: RuntimeCapabilities = {
   supportsApprovals: false,
   supportsCustomEndpoint: false,
   usageReporting: UsageReporting.NONE,
+  supportsInteractiveQuestions: false,
 };
 
 export interface RuntimeDescriptor {
@@ -231,12 +268,37 @@ export interface RuntimeRunInput {
   usageContext: RuntimeUsageContext;
 }
 
+export interface RuntimeSessionForkInput extends RuntimeRunInput {
+  sourceSessionId: string;
+}
+
 export interface RuntimeEvent {
   type: string;
   timestamp: string;
   level?: "debug" | "info" | "warn" | "error";
   message?: string;
   data?: Record<string, unknown>;
+}
+
+/**
+ * Runtime-neutral payload for interactive question events (`tool:question`).
+ * Adapters that expose a "ask the user something" tool (e.g. Claude's
+ * `AskUserQuestion`) parse their native shape into this before emitting, so
+ * consumers (chat UI, schedulers) render questions the same way regardless
+ * of which runtime produced them.
+ */
+export interface RuntimeToolQuestionPayload {
+  /** Adapter-native tool call id, when available — used to de-duplicate re-emits. */
+  toolUseId: string | null;
+  /** Original tool name as seen by the adapter (e.g. "AskUserQuestion"). */
+  toolName: string;
+  /** One or more questions bundled together. Most adapters send exactly one. */
+  questions: Array<{
+    question: string;
+    header?: string;
+    multiSelect?: boolean;
+    options: Array<{ label: string; description?: string }>;
+  }>;
 }
 
 export interface RuntimeUsage {
@@ -293,6 +355,7 @@ export interface RuntimeSessionListInput {
   providerId?: string;
   profileId?: string | null;
   projectRoot?: string;
+  transport?: RuntimeTransport;
   limit?: number;
   options?: Record<string, unknown>;
   headers?: Record<string, string>;
@@ -303,6 +366,7 @@ export interface RuntimeSessionGetInput {
   providerId?: string;
   profileId?: string | null;
   projectRoot?: string;
+  transport?: RuntimeTransport;
   sessionId: string;
   options?: Record<string, unknown>;
   headers?: Record<string, string>;
@@ -394,6 +458,7 @@ export interface RuntimeDiagnoseErrorInput {
  * ## Optional — capabilities-gated
  * Implement these when `descriptor.capabilities` flags are true:
  * - `resume()` — re-enter an existing session (supportsResume)
+ * - `forkSession()` — fork a source session into a child run (supportsSessionFork)
  * - `listSessions()` / `getSession()` / `listSessionEvents()` — session management (supportsSessionList)
  * - `listModels()` — enumerate available models (supportsModelDiscovery)
  * - `validateConnection()` — health check for readiness endpoint
@@ -432,6 +497,8 @@ export interface RuntimeAdapter {
 
   /** Resume an existing session. Gate: supportsResume. */
   resume?(input: RuntimeRunInput & { sessionId: string }): Promise<RuntimeRunResult>;
+  /** Fork a source session into a child run. Gate: supportsSessionFork. */
+  forkSession?(input: RuntimeSessionForkInput): Promise<RuntimeRunResult>;
   /** List recent sessions. Gate: supportsSessionList. */
   listSessions?(input: RuntimeSessionListInput): Promise<RuntimeSession[]>;
   /** Get a single session by ID. Gate: supportsSessionList. */

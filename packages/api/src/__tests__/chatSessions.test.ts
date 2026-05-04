@@ -5,6 +5,8 @@ import type { RuntimeAdapter } from "@aif/runtime";
 const mockCreateChatSession = vi.fn();
 const mockFindChatSessionById = vi.fn();
 const mockListChatSessions = vi.fn();
+const mockListCodexSessionsByProjectRoot = vi.fn();
+const mockFindCodexSessionFilePathBySessionId = vi.fn();
 const mockUpdateChatSession = vi.fn();
 const mockDeleteChatSession = vi.fn();
 const mockListChatMessages = vi.fn();
@@ -21,10 +23,13 @@ const mockBroadcast = vi.fn();
 const mockResolveApiRuntimeContext = vi.fn();
 const mockGetApiRuntimeRegistry = vi.fn();
 const mockSessionCacheKey = vi.fn((..._args: unknown[]) => "runtime-cache");
+const mockShouldUseSessionCacheForRuntime = vi.fn(() => true);
 
 const mockListSessions = vi.fn();
 const mockGetSession = vi.fn();
 const mockListSessionEvents = vi.fn();
+const mockReadCodexSessionMetaFromFile = vi.fn();
+const mockReadCodexSessionEventsFromFile = vi.fn();
 
 const runtimeAdapter: RuntimeAdapter = {
   descriptor: {
@@ -34,6 +39,7 @@ const runtimeAdapter: RuntimeAdapter = {
     defaultTransport: "sdk",
     capabilities: {
       supportsResume: true,
+      supportsSessionFork: false,
       supportsSessionList: true,
       supportsAgentDefinitions: true,
       supportsStreaming: true,
@@ -53,6 +59,10 @@ vi.mock("@aif/data", () => ({
   createChatSession: (...args: unknown[]) => mockCreateChatSession(...args),
   findChatSessionById: (...args: unknown[]) => mockFindChatSessionById(...args),
   listChatSessions: (...args: unknown[]) => mockListChatSessions(...args),
+  listCodexSessionsByProjectRoot: (...args: unknown[]) =>
+    mockListCodexSessionsByProjectRoot(...args),
+  findCodexSessionFilePathBySessionId: (...args: unknown[]) =>
+    mockFindCodexSessionFilePathBySessionId(...args),
   updateChatSession: (...args: unknown[]) => mockUpdateChatSession(...args),
   deleteChatSession: (...args: unknown[]) => mockDeleteChatSession(...args),
   listChatMessages: (...args: unknown[]) => mockListChatMessages(...args),
@@ -67,6 +77,15 @@ vi.mock("@aif/data", () => ({
   toRuntimeProfileResponse: (row: Record<string, unknown>) => mockToRuntimeProfileResponse(row),
   createDbUsageSink: () => ({ record: vi.fn() }),
 }));
+vi.mock("@aif/runtime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@aif/runtime")>();
+  return {
+    ...actual,
+    readCodexSessionMetaFromFile: (...args: unknown[]) => mockReadCodexSessionMetaFromFile(...args),
+    readCodexSessionEventsFromFile: (...args: unknown[]) =>
+      mockReadCodexSessionEventsFromFile(...args),
+  };
+});
 
 vi.mock("../services/runtime.js", () => ({
   resolveApiRuntimeContext: (input: unknown) => mockResolveApiRuntimeContext(input),
@@ -84,7 +103,8 @@ vi.mock("../services/sessionCache.js", () => ({
   setCached: vi.fn(),
   invalidateCache: vi.fn(),
   invalidateAllSessionCaches: vi.fn(),
-  sessionCacheKey: (...args: unknown[]) => mockSessionCacheKey(...args),
+  sessionCacheKey: mockSessionCacheKey,
+  shouldUseSessionCacheForRuntime: mockShouldUseSessionCacheForRuntime,
 }));
 
 vi.mock("@aif/shared", async (importOriginal) => {
@@ -93,6 +113,8 @@ vi.mock("@aif/shared", async (importOriginal) => {
     ...actual,
     getEnv: () => ({
       AGENT_BYPASS_PERMISSIONS: false,
+      AIF_DEFAULT_RUNTIME_ID: "claude",
+      AIF_DEFAULT_PROVIDER_ID: "anthropic",
     }),
   };
 });
@@ -149,7 +171,14 @@ describe("chat session API", () => {
     mockListSessions.mockResolvedValue([]);
     mockGetSession.mockResolvedValue(null);
     mockListSessionEvents.mockResolvedValue([]);
-    mockFindRuntimeProfileById.mockReturnValue(null);
+    mockListCodexSessionsByProjectRoot.mockReturnValue([]);
+    mockFindCodexSessionFilePathBySessionId.mockReturnValue(null);
+    mockReadCodexSessionMetaFromFile.mockResolvedValue(null);
+    mockReadCodexSessionEventsFromFile.mockResolvedValue([]);
+    mockShouldUseSessionCacheForRuntime.mockReturnValue(true);
+    mockFindRuntimeProfileById.mockImplementation((id: string) =>
+      id === "profile-1" ? { id, projectId: "proj-1" } : null,
+    );
   });
 
   describe("GET /chat/sessions", () => {
@@ -181,6 +210,58 @@ describe("chat session API", () => {
       expect(body.some((row: { id: string }) => row.id.startsWith("sdk:"))).toBe(true);
     });
 
+    it("uses runtime-prefixed ids for non-sdk session discovery and marks app-server as local source", async () => {
+      mockResolveApiRuntimeContext.mockResolvedValueOnce({
+        project: { id: "proj-1", rootPath: "/tmp/proj" },
+        adapter: runtimeAdapter,
+        resolvedProfile: {
+          source: "project_default",
+          profileId: "profile-codex-app-server",
+          runtimeId: "codex",
+          providerId: "openai",
+          transport: "app-server",
+          model: null,
+          baseUrl: null,
+          apiKey: null,
+          apiKeyEnvVar: null,
+          headers: {},
+          options: {},
+        },
+        selectionSource: "project_default",
+      });
+      mockListCodexSessionsByProjectRoot.mockReturnValue([
+        {
+          sessionId: "thread-123",
+          filePath: "/tmp/proj/.codex/sessions/thread-123.jsonl",
+          title: "Codex App Server Session",
+          projectRoot: "/tmp/proj",
+          accountFingerprint: "fp-1",
+          sourceCreatedAt: "2026-04-01T12:00:00Z",
+          sourceUpdatedAt: "2026-04-02T00:00:00Z",
+          messageCount: 2,
+          previewText: "Codex App Server Session",
+          sizeBytes: 100,
+          mtimeMs: 100,
+          lastIndexedAt: "2026-04-02T00:00:00Z",
+          createdAt: "2026-04-01T12:00:00Z",
+          updatedAt: "2026-04-02T00:00:00Z",
+        },
+      ]);
+
+      const res = await app.request("/chat/sessions?projectId=proj-1");
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      const runtimeSession = body.find((row: { id: string }) => row.id.includes("thread-123"));
+      expect(runtimeSession).toBeDefined();
+      expect(runtimeSession.id).toBe("runtime:codex:thread-123");
+      expect(runtimeSession.source).toBe("cli");
+      expect(mockListCodexSessionsByProjectRoot).toHaveBeenCalledWith({
+        projectRoot: "/tmp/proj",
+        limit: 50,
+      });
+      expect(mockListSessions).not.toHaveBeenCalled();
+    });
+
     it("filters out already linked runtime sessions", async () => {
       mockListChatSessions.mockReturnValue([
         { ...SESSION_ROW, runtimeSessionId: "runtime-linked" },
@@ -207,6 +288,54 @@ describe("chat session API", () => {
       const body = await res.json();
       expect(body).toHaveLength(1);
     });
+
+    it("uses indexed Codex sessions instead of adapter discovery", async () => {
+      mockResolveApiRuntimeContext.mockResolvedValueOnce({
+        project: { id: "proj-1", rootPath: "/tmp/proj" },
+        adapter: runtimeAdapter,
+        resolvedProfile: {
+          source: "project_default",
+          profileId: "profile-1",
+          runtimeId: "codex",
+          providerId: "openai",
+          transport: "sdk",
+          model: null,
+          baseUrl: null,
+          apiKey: null,
+          apiKeyEnvVar: null,
+          headers: {},
+          options: {},
+        },
+        selectionSource: "project_default",
+      });
+      mockListCodexSessionsByProjectRoot.mockReturnValue([
+        {
+          sessionId: "codex-abc",
+          filePath: "/tmp/proj/.codex/sessions/a.jsonl",
+          title: "Indexed Session",
+          projectRoot: "/tmp/proj",
+          accountFingerprint: "fp-1",
+          sourceCreatedAt: "2026-04-01T12:00:00Z",
+          sourceUpdatedAt: "2026-04-02T00:00:00Z",
+          messageCount: 2,
+          previewText: "Indexed preview",
+          sizeBytes: 100,
+          mtimeMs: 100,
+          lastIndexedAt: "2026-04-02T00:00:00Z",
+          createdAt: "2026-04-01T12:00:00Z",
+          updatedAt: "2026-04-02T00:00:00Z",
+        },
+      ]);
+
+      const res = await app.request("/chat/sessions?projectId=proj-1");
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(
+        body.some((row: { runtimeSessionId: string }) => row.runtimeSessionId === "codex-abc"),
+      ).toBe(true);
+      expect(mockListSessions).not.toHaveBeenCalled();
+      expect(mockShouldUseSessionCacheForRuntime).not.toHaveBeenCalled();
+    });
   });
 
   describe("POST /chat/sessions", () => {
@@ -216,13 +345,69 @@ describe("chat session API", () => {
       const res = await app.request("/chat/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projectId: "proj-1", title: "New Chat" }),
+        body: JSON.stringify({
+          projectId: "proj-1",
+          title: "New Chat",
+          runtimeProfileId: "profile-1",
+          runtimeSessionId: "runtime-session-1",
+        }),
       });
 
       expect(res.status).toBe(201);
+      expect(mockCreateChatSession).toHaveBeenCalledWith({
+        projectId: "proj-1",
+        title: "New Chat",
+        runtimeProfileId: "profile-1",
+        runtimeSessionId: "runtime-session-1",
+      });
       expect(mockBroadcast).toHaveBeenCalledWith(
         expect.objectContaining({ type: "chat:session_created" }),
       );
+    });
+
+    it("rejects runtime profiles owned by a different project", async () => {
+      mockFindRuntimeProfileById.mockReturnValue({
+        id: "foreign-profile",
+        projectId: "other-project",
+      });
+
+      const res = await app.request("/chat/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: "proj-1",
+          title: "New Chat",
+          runtimeProfileId: "foreign-profile",
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBeTruthy();
+      expect(body.fieldErrors.runtimeProfileId).toBeDefined();
+    });
+
+    it("rejects disabled runtime profiles on create", async () => {
+      mockFindRuntimeProfileById.mockReturnValue({
+        id: "disabled-profile",
+        projectId: null,
+        enabled: false,
+      });
+
+      const res = await app.request("/chat/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: "proj-1",
+          title: "New Chat",
+          runtimeProfileId: "disabled-profile",
+        }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBeTruthy();
+      expect(body.fieldErrors.runtimeProfileId).toBeDefined();
     });
   });
 
@@ -249,6 +434,106 @@ describe("chat session API", () => {
       const body = await res.json();
       expect(body.id).toBe("sdk:abc-123");
       expect(body.title).toBe("Runtime Session");
+    });
+
+    it("marks runtime-prefixed codex app-server sessions as local source", async () => {
+      mockFindRuntimeProfileById.mockReturnValue({
+        id: "profile-codex-app-server",
+        projectId: "proj-1",
+        name: "Codex App Server",
+        runtimeId: "codex",
+        providerId: "openai",
+        transport: "app-server",
+        baseUrl: null,
+        apiKeyEnvVar: "OPENAI_API_KEY",
+        defaultModel: "gpt-5.4",
+        headersJson: JSON.stringify({}),
+        optionsJson: JSON.stringify({}),
+        enabled: 1,
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+      });
+      mockGetSession.mockResolvedValue({
+        id: "thread-123",
+        title: "Codex App Server Session",
+        createdAt: "2026-04-01T00:00:00Z",
+        updatedAt: "2026-04-01T12:00:00Z",
+      });
+
+      const res = await app.request(
+        "/chat/sessions/runtime:codex:thread-123?projectId=proj-1&runtimeProfileId=profile-codex-app-server",
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.id).toBe("runtime:codex:thread-123");
+      expect(body.source).toBe("cli");
+    });
+
+    it("passes runtime profile context to virtual session lookup", async () => {
+      mockFindRuntimeProfileById.mockReturnValue({
+        id: "profile-claude",
+        projectId: null,
+        name: "Claude Profile",
+        runtimeId: "claude",
+        providerId: "anthropic",
+        transport: "sdk",
+        baseUrl: "https://api.example.test",
+        apiKeyEnvVar: "OPENAI_API_KEY",
+        defaultModel: "claude-sonnet",
+        headersJson: JSON.stringify({ "x-profile": "1" }),
+        optionsJson: JSON.stringify({ region: "us" }),
+        enabled: 1,
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+      });
+      mockGetSession.mockResolvedValue({
+        id: "abc-123",
+        title: "Runtime Session",
+        createdAt: "2026-04-01T00:00:00Z",
+        updatedAt: "2026-04-01T12:00:00Z",
+      });
+
+      const res = await app.request(
+        "/chat/sessions/sdk:abc-123?projectId=proj-1&runtimeProfileId=profile-claude",
+      );
+
+      expect(res.status).toBe(200);
+      expect(mockGetSession).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runtimeId: "claude",
+          providerId: "anthropic",
+          profileId: "profile-claude",
+          transport: "sdk",
+          sessionId: "abc-123",
+          options: expect.objectContaining({
+            region: "us",
+            baseUrl: "https://api.example.test",
+            apiKeyEnvVar: "OPENAI_API_KEY",
+          }),
+          headers: { "x-profile": "1" },
+        }),
+      );
+      const body = await res.json();
+      expect(body.runtimeProfileId).toBe("profile-claude");
+    });
+
+    it("loads Codex virtual session details from indexed file-path mapping", async () => {
+      mockFindCodexSessionFilePathBySessionId.mockReturnValue("/tmp/proj/.codex/sessions/a.jsonl");
+      mockReadCodexSessionMetaFromFile.mockResolvedValue({
+        id: "codex-idx-1",
+        prompt: "Indexed Codex Session",
+        createdAt: "2026-04-01T00:00:00Z",
+        updatedAt: "2026-04-01T12:00:00Z",
+        filePath: "/tmp/proj/.codex/sessions/a.jsonl",
+      });
+
+      const res = await app.request("/chat/sessions/runtime:codex:codex-idx-1");
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.id).toBe("runtime:codex:codex-idx-1");
+      expect(body.runtimeSessionId).toBe("codex-idx-1");
+      expect(body.title).toBe("Indexed Codex Session");
+      expect(mockGetSession).not.toHaveBeenCalled();
     });
   });
 
@@ -296,6 +581,161 @@ describe("chat session API", () => {
       expect(body[1].role).toBe("assistant");
     });
 
+    it("passes runtime profile context to virtual session event listing", async () => {
+      mockFindRuntimeProfileById.mockReturnValue({
+        id: "profile-claude",
+        projectId: null,
+        name: "Claude Profile",
+        runtimeId: "claude",
+        providerId: "anthropic",
+        transport: "sdk",
+        baseUrl: "https://api.example.test",
+        apiKeyEnvVar: "OPENAI_API_KEY",
+        defaultModel: "claude-sonnet",
+        headersJson: JSON.stringify({ "x-profile": "1" }),
+        optionsJson: JSON.stringify({ region: "us" }),
+        enabled: 1,
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+      });
+      mockListSessionEvents.mockResolvedValue([]);
+
+      const res = await app.request(
+        "/chat/sessions/sdk:abc-123/messages?projectId=proj-1&runtimeProfileId=profile-claude",
+      );
+      expect(res.status).toBe(200);
+      expect(mockListSessionEvents).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runtimeId: "claude",
+          providerId: "anthropic",
+          profileId: "profile-claude",
+          transport: "sdk",
+          sessionId: "abc-123",
+          options: expect.objectContaining({
+            region: "us",
+            baseUrl: "https://api.example.test",
+            apiKeyEnvVar: "OPENAI_API_KEY",
+          }),
+          headers: { "x-profile": "1" },
+        }),
+      );
+    });
+
+    it("deduplicates a mixed text+question turn on reload of a linked DB session", async () => {
+      // Regression for PR#77 review item #2 — Claude replay splits a mixed
+      // assistant turn into a `session-message` (intro text) and a separate
+      // `tool:question`. POST now persists the same split shape (two rows),
+      // so mergeRuntimeAndDbMessages matches each runtime event to its DB row
+      // by exact trimmed-content equality instead of appending a stale
+      // combined row as a third duplicate.
+      mockFindChatSessionById.mockReturnValue({
+        ...SESSION_ROW,
+        runtimeSessionId: "runtime-linked",
+      });
+
+      const introContent = "Let me check the options.";
+      const questionContent = [
+        "",
+        "",
+        "**❓ Pick a mode**",
+        "",
+        "1. A",
+        "2. B",
+        "",
+        "_Answer by number or free text in the next message._",
+        "",
+        "",
+      ].join("\n");
+
+      mockListChatMessages.mockReturnValue([
+        {
+          id: "m-user",
+          sessionId: "session-1",
+          role: "user",
+          content: "mixed prompt",
+          createdAt: "2026-04-10T00:00:00Z",
+        },
+        {
+          id: "m-intro",
+          sessionId: "session-1",
+          role: "assistant",
+          content: introContent,
+          createdAt: "2026-04-10T00:00:01Z",
+        },
+        {
+          id: "m-question",
+          sessionId: "session-1",
+          role: "assistant",
+          content: questionContent.trim(),
+          createdAt: "2026-04-10T00:00:02Z",
+        },
+      ]);
+
+      mockListSessionEvents.mockResolvedValue([
+        {
+          type: "session-message",
+          timestamp: "2026-04-10T00:00:00Z",
+          message: "mixed prompt",
+          data: { role: "user", id: "u1" },
+        },
+        {
+          type: "session-message",
+          timestamp: "2026-04-10T00:00:01Z",
+          message: introContent,
+          data: { role: "assistant", id: "a1" },
+        },
+        {
+          type: "tool:question",
+          timestamp: "2026-04-10T00:00:02Z",
+          data: {
+            toolUseId: "tool-reload",
+            toolName: "AskUserQuestion",
+            questions: [{ question: "Pick a mode", options: [{ label: "A" }, { label: "B" }] }],
+          },
+        },
+      ]);
+
+      const res = await app.request("/chat/sessions/session-1/messages");
+      expect(res.status).toBe(200);
+      const messages = (await res.json()) as Array<{ role: string; content: string }>;
+      expect(messages.length).toBe(3);
+      expect(messages.filter((m) => m.role === "user").length).toBe(1);
+      expect(messages.filter((m) => m.role === "assistant").length).toBe(2);
+      expect(messages.filter((m) => m.content.includes("Let me check the options.")).length).toBe(
+        1,
+      );
+      expect(messages.filter((m) => m.content.includes("Pick a mode")).length).toBe(1);
+    });
+
+    it("assigns a stable id to tool:question events based on toolUseId across repeated fetches", async () => {
+      // Regression for PR#77 review item #3 — without this, eventId() falls
+      // back to crypto.randomUUID() on every fetch, churning the UI's message
+      // keys and causing visible list re-ordering/flicker on reload.
+      mockListSessionEvents.mockResolvedValue([
+        {
+          type: "tool:question",
+          timestamp: "2026-04-10T00:00:00Z",
+          data: {
+            toolUseId: "tool-stable-42",
+            toolName: "AskUserQuestion",
+            questions: [{ question: "Pick?", options: [{ label: "A" }] }],
+          },
+        },
+      ]);
+
+      const first = await app.request("/chat/sessions/sdk:stable-abc/messages");
+      expect(first.status).toBe(200);
+      const firstBody = (await first.json()) as Array<{ id: string; content: string }>;
+      const second = await app.request("/chat/sessions/sdk:stable-abc/messages");
+      expect(second.status).toBe(200);
+      const secondBody = (await second.json()) as Array<{ id: string; content: string }>;
+
+      expect(firstBody).toHaveLength(1);
+      expect(secondBody).toHaveLength(1);
+      expect(firstBody[0].id).toBe("tool:question:tool-stable-42");
+      expect(secondBody[0].id).toBe(firstBody[0].id);
+    });
+
     it("passes runtime profile options and headers when loading linked runtime session events", async () => {
       mockFindChatSessionById.mockReturnValue({
         ...SESSION_ROW,
@@ -336,21 +776,93 @@ describe("chat session API", () => {
         }),
       );
     });
+
+    it("loads Codex virtual session messages from indexed file-path mapping", async () => {
+      mockFindCodexSessionFilePathBySessionId.mockReturnValue("/tmp/proj/.codex/sessions/a.jsonl");
+      mockReadCodexSessionEventsFromFile.mockResolvedValue([
+        {
+          type: "session-message",
+          timestamp: "2026-04-01T00:00:00Z",
+          message: "Indexed hello",
+          data: { role: "assistant", id: "idx-1" },
+        },
+      ]);
+
+      const res = await app.request("/chat/sessions/runtime:codex:codex-idx-1/messages");
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toHaveLength(1);
+      expect(body[0].content).toBe("Indexed hello");
+      expect(mockListSessionEvents).not.toHaveBeenCalled();
+    });
   });
 
   describe("PUT /chat/sessions/:id", () => {
-    it("updates title", async () => {
+    it("updates title and runtime profile fields", async () => {
       mockFindChatSessionById.mockReturnValue(SESSION_ROW);
-      mockUpdateChatSession.mockReturnValue({ ...SESSION_ROW, title: "Renamed" });
+      mockUpdateChatSession.mockReturnValue({
+        ...SESSION_ROW,
+        title: "Renamed",
+        runtimeProfileId: "profile-1",
+        runtimeSessionId: "runtime-session-2",
+      });
 
       const res = await app.request("/chat/sessions/session-1", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "Renamed" }),
+        body: JSON.stringify({
+          title: "Renamed",
+          runtimeProfileId: "profile-1",
+          runtimeSessionId: "runtime-session-2",
+        }),
       });
       expect(res.status).toBe(200);
+      expect(mockUpdateChatSession).toHaveBeenCalledWith("session-1", {
+        title: "Renamed",
+        runtimeProfileId: "profile-1",
+        runtimeSessionId: "runtime-session-2",
+      });
       const body = await res.json();
       expect(body.title).toBe("Renamed");
+    });
+
+    it("rejects runtime profiles owned by a different project on update", async () => {
+      mockFindChatSessionById.mockReturnValue(SESSION_ROW);
+      mockFindRuntimeProfileById.mockReturnValue({
+        id: "foreign-profile",
+        projectId: "other-project",
+      });
+
+      const res = await app.request("/chat/sessions/session-1", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runtimeProfileId: "foreign-profile" }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBeTruthy();
+      expect(body.fieldErrors.runtimeProfileId).toBeDefined();
+    });
+
+    it("rejects disabled runtime profiles on update", async () => {
+      mockFindChatSessionById.mockReturnValue(SESSION_ROW);
+      mockFindRuntimeProfileById.mockReturnValue({
+        id: "disabled-profile",
+        projectId: null,
+        enabled: false,
+      });
+
+      const res = await app.request("/chat/sessions/session-1", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runtimeProfileId: "disabled-profile" }),
+      });
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toBeTruthy();
+      expect(body.fieldErrors.runtimeProfileId).toBeDefined();
     });
   });
 

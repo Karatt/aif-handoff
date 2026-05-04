@@ -7,10 +7,71 @@ import { eq } from "drizzle-orm";
 import { chatSessions } from "../schema.js";
 import { closeDb, createTestDb, getDb } from "../db.js";
 
+function removeSqliteArtifacts(dbPath: string): void {
+  for (const path of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      // Windows can hold SQLite sidecars briefly after close; ignore cleanup noise in tests.
+    }
+  }
+}
+
 describe("db", () => {
   it("createTestDb returns a working database with indexes", () => {
     const db = createTestDb();
     expect(db).toBeDefined();
+  });
+
+  it("creates Codex index tables for fresh databases", () => {
+    closeDb();
+    const dbPath = join(tmpdir(), `aif-shared-codex-index-${Date.now()}-${Math.random()}.sqlite`);
+
+    try {
+      getDb(dbPath);
+      closeDb();
+
+      const sqlite = new Database(dbPath, { readonly: true });
+      const tableNames = sqlite
+        .prepare(
+          `
+          SELECT name
+          FROM sqlite_master
+          WHERE type = 'table'
+            AND name IN (
+              'codex_sessions',
+              'codex_session_files',
+              'codex_limit_heads',
+              'codex_limit_history',
+              'codex_index_cursors'
+            )
+        `,
+        )
+        .all() as Array<{ name: string }>;
+      const dirtyIndex = sqlite
+        .prepare(
+          `
+          SELECT name
+          FROM sqlite_master
+          WHERE type = 'index'
+            AND name = 'idx_codex_session_files_dirty'
+        `,
+        )
+        .get() as { name: string } | undefined;
+      sqlite.close();
+
+      expect(tableNames.map((row) => row.name).sort()).toEqual([
+        "codex_index_cursors",
+        "codex_limit_heads",
+        "codex_limit_history",
+        "codex_session_files",
+        "codex_sessions",
+      ]);
+      expect(dirtyIndex).toBeUndefined();
+    } finally {
+      closeDb();
+      removeSqliteArtifacts(dbPath);
+    }
   });
 
   it("index bootstrap is idempotent — calling createTestDb twice does not throw", () => {
@@ -19,6 +80,51 @@ describe("db", () => {
     const db2 = createTestDb();
     expect(db1).toBeDefined();
     expect(db2).toBeDefined();
+  });
+
+  it("creates and seeds a singleton app_settings row", () => {
+    closeDb();
+    const dbPath = join(tmpdir(), `aif-shared-app-settings-${Date.now()}-${Math.random()}.sqlite`);
+
+    try {
+      getDb(dbPath);
+      closeDb();
+
+      const sqlite = new Database(dbPath, { readonly: true });
+      const rows = sqlite
+        .prepare(
+          `
+          SELECT
+            id,
+            default_task_runtime_profile_id,
+            default_plan_runtime_profile_id,
+            default_review_runtime_profile_id,
+            default_chat_runtime_profile_id
+          FROM app_settings
+        `,
+        )
+        .all() as Array<{
+        id: number;
+        default_task_runtime_profile_id: string | null;
+        default_plan_runtime_profile_id: string | null;
+        default_review_runtime_profile_id: string | null;
+        default_chat_runtime_profile_id: string | null;
+      }>;
+      sqlite.close();
+
+      expect(rows).toEqual([
+        {
+          id: 1,
+          default_task_runtime_profile_id: null,
+          default_plan_runtime_profile_id: null,
+          default_review_runtime_profile_id: null,
+          default_chat_runtime_profile_id: null,
+        },
+      ]);
+    } finally {
+      closeDb();
+      removeSqliteArtifacts(dbPath);
+    }
   });
 
   it("migrates pre-v6 schema and backfills runtime_session_id from agent_session_id", () => {
@@ -52,7 +158,7 @@ describe("db", () => {
         plan_docs INTEGER NOT NULL DEFAULT 0,
         plan_tests INTEGER NOT NULL DEFAULT 0,
         skip_review INTEGER NOT NULL DEFAULT 0,
-        use_subagents INTEGER NOT NULL DEFAULT 1,
+        use_subagents INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'backlog',
         priority INTEGER NOT NULL DEFAULT 0,
         position REAL NOT NULL DEFAULT 1000.0,
@@ -131,7 +237,7 @@ describe("db", () => {
       expect(migrated?.runtimeSessionId).toBe("legacy-agent-session");
     } finally {
       closeDb();
-      rmSync(dbPath, { force: true });
+      removeSqliteArtifacts(dbPath);
     }
   });
 
@@ -170,7 +276,7 @@ describe("db", () => {
         plan_docs INTEGER NOT NULL DEFAULT 0,
         plan_tests INTEGER NOT NULL DEFAULT 0,
         skip_review INTEGER NOT NULL DEFAULT 0,
-        use_subagents INTEGER NOT NULL DEFAULT 1,
+        use_subagents INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'backlog',
         priority INTEGER NOT NULL DEFAULT 0,
         position REAL NOT NULL DEFAULT 1000.0,
@@ -269,6 +375,9 @@ describe("db", () => {
       const taskColumns = migratedSqlite.prepare(`PRAGMA table_info(tasks)`).all() as Array<{
         name: string;
       }>;
+      const runtimeProfileColumns = migratedSqlite
+        .prepare(`PRAGMA table_info(runtime_profiles)`)
+        .all() as Array<{ name: string }>;
       const userVersion = migratedSqlite.pragma("user_version", { simple: true }) as number;
       migratedSqlite.close();
 
@@ -280,12 +389,262 @@ describe("db", () => {
         expect.arrayContaining(["token_input", "token_output", "token_total", "cost_usd"]),
       );
       expect(taskColumns.map((column) => column.name)).toEqual(
-        expect.arrayContaining(["manual_review_required", "auto_review_state_json"]),
+        expect.arrayContaining([
+          "manual_review_required",
+          "auto_review_state_json",
+          "runtime_limit_snapshot_json",
+          "runtime_limit_updated_at",
+          "branch_name",
+          "worktree_path",
+        ]),
       );
-      expect(userVersion).toBe(12);
+      expect(runtimeProfileColumns.map((column) => column.name)).toEqual(
+        expect.arrayContaining(["runtime_limit_snapshot_json", "runtime_limit_updated_at"]),
+      );
+      expect(userVersion).toBe(21);
     } finally {
       closeDb();
-      rmSync(dbPath, { force: true });
+      removeSqliteArtifacts(dbPath);
+    }
+  });
+
+  it("drops the unused Codex session-files dirty index when migrating v17 databases", () => {
+    closeDb();
+    const dbPath = join(
+      tmpdir(),
+      `aif-shared-codex-index-drop-${Date.now()}-${Math.random()}.sqlite`,
+    );
+    const sqlite = new Database(dbPath);
+
+    sqlite.exec(`
+      CREATE TABLE codex_session_files (
+        file_path TEXT PRIMARY KEY,
+        session_id TEXT,
+        size_bytes INTEGER NOT NULL DEFAULT 0,
+        mtime_ms INTEGER NOT NULL DEFAULT 0,
+        parsed_offset INTEGER NOT NULL DEFAULT 0,
+        pending_tail TEXT NOT NULL DEFAULT '',
+        missing INTEGER NOT NULL DEFAULT 0,
+        import_version INTEGER NOT NULL DEFAULT 1,
+        last_seen_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+      CREATE INDEX idx_codex_session_files_dirty
+        ON codex_session_files(missing, mtime_ms, size_bytes);
+    `);
+    sqlite.pragma("user_version = 17");
+    sqlite.close();
+
+    try {
+      getDb(dbPath);
+      closeDb();
+
+      const migratedSqlite = new Database(dbPath, { readonly: true });
+      const dirtyIndex = migratedSqlite
+        .prepare(
+          `
+          SELECT name
+          FROM sqlite_master
+          WHERE type = 'index'
+            AND name = 'idx_codex_session_files_dirty'
+        `,
+        )
+        .get() as { name: string } | undefined;
+      const userVersion = migratedSqlite.pragma("user_version", { simple: true }) as number;
+      migratedSqlite.close();
+
+      expect(dirtyIndex).toBeUndefined();
+      expect(userVersion).toBe(21);
+    } finally {
+      closeDb();
+      removeSqliteArtifacts(dbPath);
+    }
+  });
+
+  it("recovers v13 runtime-limit columns for DBs stranded at user_version=14 after branch-merge reordering", () => {
+    closeDb();
+    const dbPath = join(tmpdir(), `aif-shared-v14-stranded-${Date.now()}-${Math.random()}.sqlite`);
+    const sqlite = new Database(dbPath);
+
+    sqlite.exec(`
+      CREATE TABLE runtime_profiles (
+        id TEXT PRIMARY KEY,
+        project_id TEXT,
+        name TEXT NOT NULL,
+        runtime_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,
+        transport TEXT,
+        base_url TEXT,
+        api_key_env_var TEXT,
+        default_model TEXT,
+        headers_json TEXT NOT NULL DEFAULT '{}',
+        options_json TEXT NOT NULL DEFAULT '{}',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'backlog',
+        position REAL NOT NULL DEFAULT 1000.0,
+        retry_after TEXT,
+        locked_by TEXT,
+        locked_until TEXT,
+        scheduled_at TEXT,
+        runtime_profile_id TEXT
+      );
+    `);
+    sqlite.pragma("user_version = 14");
+    sqlite.close();
+
+    try {
+      getDb(dbPath);
+      closeDb();
+
+      const migratedSqlite = new Database(dbPath, { readonly: true });
+      const taskColumns = migratedSqlite.prepare(`PRAGMA table_info(tasks)`).all() as Array<{
+        name: string;
+      }>;
+      const profileColumns = migratedSqlite
+        .prepare(`PRAGMA table_info(runtime_profiles)`)
+        .all() as Array<{ name: string }>;
+      const userVersion = migratedSqlite.pragma("user_version", { simple: true }) as number;
+      migratedSqlite.close();
+
+      expect(taskColumns.map((column) => column.name)).toEqual(
+        expect.arrayContaining([
+          "runtime_limit_snapshot_json",
+          "runtime_limit_updated_at",
+          "branch_name",
+          "worktree_path",
+        ]),
+      );
+      expect(profileColumns.map((column) => column.name)).toEqual(
+        expect.arrayContaining(["runtime_limit_snapshot_json", "runtime_limit_updated_at"]),
+      );
+      expect(userVersion).toBe(21);
+    } finally {
+      closeDb();
+      removeSqliteArtifacts(dbPath);
+    }
+  });
+
+  it("upgrades a v18 schema to current by adding task git-isolation columns and warmup sessions", () => {
+    closeDb();
+    const dbPath = join(tmpdir(), `aif-shared-v18-to-v19-${Date.now()}-${Math.random()}.sqlite`);
+    const sqlite = new Database(dbPath);
+
+    // Minimal pre-v19 schema with the columns the v6→v18 migrations would have
+    // produced. The point of this test is to lock the v19 contract: the
+    // upgrade must add `branch_name` and `worktree_path`, while leaving every
+    // prior column (esp. the v15 runtime_limit recovery columns) intact. If
+    // this PR lands second after another migration merges to main, this test
+    // will fail and force the rebaser to bump to a free trailing version slot
+    // rather than silently re-using an existing version with different SQL.
+    sqlite.exec(`
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'backlog',
+        position REAL NOT NULL DEFAULT 1000.0,
+        manual_review_required INTEGER NOT NULL DEFAULT 0,
+        auto_review_state_json TEXT,
+        runtime_limit_snapshot_json TEXT,
+        runtime_limit_updated_at TEXT,
+        runtime_profile_id TEXT
+      );
+    `);
+    sqlite.pragma("user_version = 18");
+    sqlite.close();
+
+    try {
+      getDb(dbPath);
+      closeDb();
+
+      const migratedSqlite = new Database(dbPath, { readonly: true });
+      const taskColumns = migratedSqlite.prepare(`PRAGMA table_info(tasks)`).all() as Array<{
+        name: string;
+      }>;
+      const warmupTable = migratedSqlite
+        .prepare(
+          `
+          SELECT name
+          FROM sqlite_master
+          WHERE type = 'table'
+            AND name = 'runtime_warmup_sessions'
+        `,
+        )
+        .get() as { name: string } | undefined;
+      const userVersion = migratedSqlite.pragma("user_version", { simple: true }) as number;
+      migratedSqlite.close();
+
+      const taskColumnNames = taskColumns.map((column) => column.name);
+      expect(taskColumnNames).toContain("branch_name");
+      expect(taskColumnNames).toContain("worktree_path");
+      expect(taskColumnNames).toEqual(
+        expect.arrayContaining([
+          "manual_review_required",
+          "auto_review_state_json",
+          "runtime_limit_snapshot_json",
+          "runtime_limit_updated_at",
+        ]),
+      );
+      expect(warmupTable?.name).toBe("runtime_warmup_sessions");
+      expect(userVersion).toBe(21);
+    } finally {
+      closeDb();
+      removeSqliteArtifacts(dbPath);
+    }
+  });
+
+  it("creates runtime warmup sessions table and lookup indexes for fresh databases", () => {
+    closeDb();
+    const dbPath = join(tmpdir(), `aif-shared-warmup-${Date.now()}-${Math.random()}.sqlite`);
+
+    try {
+      getDb(dbPath);
+      closeDb();
+
+      const sqlite = new Database(dbPath, { readonly: true });
+      const table = sqlite
+        .prepare(
+          `
+          SELECT name
+          FROM sqlite_master
+          WHERE type = 'table'
+            AND name = 'runtime_warmup_sessions'
+        `,
+        )
+        .get() as { name: string } | undefined;
+      const indexes = sqlite
+        .prepare(
+          `
+          SELECT name
+          FROM sqlite_master
+          WHERE type = 'index'
+            AND name IN (
+              'idx_runtime_warmup_active_lookup',
+              'idx_runtime_warmup_expires'
+            )
+        `,
+        )
+        .all() as Array<{ name: string }>;
+      const userVersion = sqlite.pragma("user_version", { simple: true }) as number;
+      sqlite.close();
+
+      expect(table?.name).toBe("runtime_warmup_sessions");
+      expect(indexes.map((row) => row.name).sort()).toEqual([
+        "idx_runtime_warmup_active_lookup",
+        "idx_runtime_warmup_expires",
+      ]);
+      expect(userVersion).toBe(21);
+    } finally {
+      closeDb();
+      removeSqliteArtifacts(dbPath);
     }
   });
 });

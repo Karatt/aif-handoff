@@ -2,14 +2,26 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { jsonValidator } from "../middleware/zodValidator.js";
-import { logger, getProjectConfig } from "@aif/shared";
-import { findTaskById } from "@aif/data";
+import { internalBroadcastAuth } from "../middleware/internalBroadcastAuth.js";
+import { logger, getEnv, getProjectConfig } from "@aif/shared";
+import {
+  clearActiveRuntimeWarmupSessions,
+  createRuntimeWarmupSession,
+  expireStaleRuntimeWarmupSessions,
+  findActiveReadyRuntimeWarmupSession,
+  findRuntimeProfileById,
+  findTaskById,
+  markRuntimeWarmupSessionFailed,
+  markRuntimeWarmupSessionReady,
+  type RuntimeWarmupSessionRow,
+} from "@aif/data";
 import {
   createProjectSchema,
   roadmapImportSchema,
   roadmapGenerateSchema,
   broadcastProjectSchema,
   autoQueueModeSchema,
+  warmupCreateSchema,
 } from "../schemas.js";
 import { getAutoQueueMode, setAutoQueueMode } from "@aif/data";
 import { broadcast } from "../ws.js";
@@ -21,17 +33,159 @@ import {
   deleteProject,
   getProjectMcpServers,
 } from "../repositories/projects.js";
-import { toTaskResponse } from "@aif/data";
+import { toTaskBroadcastPayload } from "../repositories/tasks.js";
 import {
   generateRoadmapFile,
   generateRoadmapTasks,
   importGeneratedTasks,
   RoadmapGenerationError,
 } from "../services/roadmapGeneration.js";
+import { validateProjectScopedRuntimeProfileSelections } from "../services/runtimeProfileScope.js";
+import {
+  resolveApiWarmupSupport,
+  resolveApiWarmupSupports,
+  runApiRuntimeOneShot,
+  type ApiWarmupSupport,
+} from "../services/runtime.js";
 
 const log = logger("projects-route");
 
 export const projectsRouter = new Hono();
+
+const WARMUP_PROMPT =
+  "Study the current project context, including its structure, architecture layers, package boundaries, conventions, and relevant documentation, so this session can be forked for future tasks. Do not edit files. Do not summarize the context; if a final response is required, reply only that warmup is complete.";
+
+function getWarmupEnabled(): boolean {
+  return getEnv().AIF_WARMUP_ENABLED;
+}
+
+function rejectsParallelAutoQueueWithBranches(input: {
+  rootPath: string;
+  parallelEnabled: boolean;
+  autoQueueMode: boolean;
+}): string | null {
+  if (getEnv().AIF_TASK_WORKTREES_ENABLED) return null;
+  if (!input.parallelEnabled || !input.autoQueueMode) return null;
+  const config = getProjectConfig(input.rootPath);
+  if (!config.git.enabled || !config.git.create_branches) return null;
+  return "Parallel auto-queue with git.create_branches=true requires AIF_TASK_WORKTREES_ENABLED=true";
+}
+
+function warmupScopeFromSupport(
+  support: {
+    runtimeId: string | null;
+    providerId: string | null;
+    runtimeProfileId: string | null;
+    transport: string | null;
+    model: string | null;
+  },
+  projectId: string,
+) {
+  if (!support.runtimeId || !support.providerId) return null;
+  return {
+    projectId,
+    runtimeProfileId: support.runtimeProfileId,
+    runtimeId: support.runtimeId,
+    providerId: support.providerId,
+    transport: support.transport,
+    model: support.model,
+  };
+}
+
+function warmupScopeKey(scope: NonNullable<ReturnType<typeof warmupScopeFromSupport>>): string {
+  return JSON.stringify([
+    scope.projectId,
+    scope.runtimeProfileId ?? null,
+    scope.runtimeId,
+    scope.providerId,
+    scope.transport ?? null,
+    scope.model ?? null,
+  ]);
+}
+
+function supportedWarmupScopes(projectId: string, supports: ApiWarmupSupport[]) {
+  const seen = new Set<string>();
+  const scopes: Array<{
+    support: ApiWarmupSupport;
+    scope: NonNullable<ReturnType<typeof warmupScopeFromSupport>>;
+  }> = [];
+
+  for (const support of supports) {
+    if (!support.supported) continue;
+    const scope = warmupScopeFromSupport(support, projectId);
+    if (!scope) continue;
+    const key = warmupScopeKey(scope);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    scopes.push({ support, scope });
+  }
+
+  return scopes;
+}
+
+function toWarmupPayload(row: RuntimeWarmupSessionRow | undefined | null, now = new Date()) {
+  if (!row) return null;
+  const remainingSeconds = Math.max(
+    0,
+    Math.floor((Date.parse(row.expiresAt) - now.getTime()) / 1000),
+  );
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    runtimeProfileId: row.runtimeProfileId,
+    runtimeId: row.runtimeId,
+    providerId: row.providerId,
+    transport: row.transport,
+    model: row.model,
+    status: row.status,
+    ttlSeconds: row.ttlSeconds,
+    expiresAt: row.expiresAt,
+    remainingSeconds,
+    summary: row.summary,
+    errorMessage: row.errorMessage,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function broadcastWarmupUpdate(
+  projectId: string,
+  status: "ready" | "failed" | "partial" | "cleared" | "expired",
+) {
+  broadcast({ type: "project:warmup_updated", payload: { projectId, status } });
+  log.debug({ projectId, status }, "Warmup state broadcast");
+}
+
+async function buildWarmupOverview(projectId: string) {
+  const enabled = getWarmupEnabled();
+  const targetSupports = await resolveApiWarmupSupports(projectId);
+  const support =
+    targetSupports.find((target) => target.supported) ??
+    targetSupports[0] ??
+    (await resolveApiWarmupSupport(projectId));
+  const scope = warmupScopeFromSupport(support, projectId);
+  expireStaleRuntimeWarmupSessions();
+  const active = scope ? findActiveReadyRuntimeWarmupSession(scope) : undefined;
+  const warmups = supportedWarmupScopes(projectId, targetSupports)
+    .map(({ scope }) => findActiveReadyRuntimeWarmupSession(scope))
+    .filter((row): row is RuntimeWarmupSessionRow => Boolean(row))
+    .map((row) => toWarmupPayload(row));
+  return {
+    enabled,
+    support: {
+      ...support,
+      supported: enabled && support.supported,
+      skipReason: !enabled ? "feature_disabled" : (support.skipReason ?? null),
+    },
+    targets: targetSupports.map((target) => ({
+      ...target,
+      supported: enabled && target.supported,
+      skipReason: !enabled ? "feature_disabled" : (target.skipReason ?? null),
+    })),
+    warmup: toWarmupPayload(active),
+    warmups,
+  };
+}
 
 // GET /projects
 projectsRouter.get("/", (c) => {
@@ -43,6 +197,19 @@ projectsRouter.get("/", (c) => {
 // POST /projects
 projectsRouter.post("/", jsonValidator(createProjectSchema), async (c) => {
   const body = c.req.valid("json");
+  const runtimeValidation = validateProjectScopedRuntimeProfileSelections({
+    projectId: null,
+    selections: {
+      defaultTaskRuntimeProfileId: body.defaultTaskRuntimeProfileId,
+      defaultPlanRuntimeProfileId: body.defaultPlanRuntimeProfileId,
+      defaultReviewRuntimeProfileId: body.defaultReviewRuntimeProfileId,
+      defaultChatRuntimeProfileId: body.defaultChatRuntimeProfileId,
+    },
+  });
+  if (runtimeValidation) {
+    log.warn({ fieldErrors: runtimeValidation.fieldErrors }, "Rejected invalid project defaults");
+    return c.json(runtimeValidation, 400);
+  }
   const { project: created, pathError, initError } = await createProject(body);
   if (pathError) return c.json({ error: pathError }, 400);
   if (initError) return c.json({ error: initError }, 500);
@@ -61,6 +228,32 @@ projectsRouter.put("/:id", jsonValidator(createProjectSchema), async (c) => {
   const existing = findProjectById(id);
   if (!existing) {
     return c.json({ error: "Project not found" }, 404);
+  }
+
+  const runtimeValidation = validateProjectScopedRuntimeProfileSelections({
+    projectId: id,
+    selections: {
+      defaultTaskRuntimeProfileId: body.defaultTaskRuntimeProfileId,
+      defaultPlanRuntimeProfileId: body.defaultPlanRuntimeProfileId,
+      defaultReviewRuntimeProfileId: body.defaultReviewRuntimeProfileId,
+      defaultChatRuntimeProfileId: body.defaultChatRuntimeProfileId,
+    },
+  });
+  if (runtimeValidation) {
+    log.warn(
+      { projectId: id, fieldErrors: runtimeValidation.fieldErrors },
+      "Rejected invalid project defaults",
+    );
+    return c.json(runtimeValidation, 400);
+  }
+
+  const unsupportedParallelAutoQueue = rejectsParallelAutoQueueWithBranches({
+    rootPath: body.rootPath,
+    parallelEnabled: body.parallelEnabled ?? existing.parallelEnabled,
+    autoQueueMode: existing.autoQueueMode,
+  });
+  if (unsupportedParallelAutoQueue) {
+    return c.json({ error: unsupportedParallelAutoQueue }, 400);
   }
 
   const { project: updated, pathError } = updateProject(id, body);
@@ -158,7 +351,7 @@ projectsRouter.post("/:id/roadmap/import", jsonValidator(roadmapImportSchema), a
     for (const taskId of result.taskIds) {
       const task = findTaskById(taskId);
       if (task) {
-        broadcast({ type: "task:created", payload: toTaskResponse(task) });
+        broadcast({ type: "task:created", payload: toTaskBroadcastPayload(task) });
       }
     }
 
@@ -209,6 +402,15 @@ projectsRouter.patch("/:id/auto-queue-mode", jsonValidator(autoQueueModeSchema),
   const project = findProjectById(id);
   if (!project) return c.json({ error: "Project not found" }, 404);
 
+  const unsupportedParallelAutoQueue = rejectsParallelAutoQueueWithBranches({
+    rootPath: project.rootPath,
+    parallelEnabled: project.parallelEnabled,
+    autoQueueMode: enabled,
+  });
+  if (unsupportedParallelAutoQueue) {
+    return c.json({ error: unsupportedParallelAutoQueue }, 400);
+  }
+
   setAutoQueueMode(id, enabled);
   const updated = findProjectById(id);
   log.info({ projectId: id, enabled }, "Toggled auto-queue-mode");
@@ -219,21 +421,286 @@ projectsRouter.patch("/:id/auto-queue-mode", jsonValidator(autoQueueModeSchema),
   return c.json({ enabled });
 });
 
-// POST /projects/:id/broadcast — emit project-scoped WS event (used by agent coordinator)
-projectsRouter.post("/:id/broadcast", jsonValidator(broadcastProjectSchema), async (c) => {
+// GET /projects/:id/warmup
+projectsRouter.get("/:id/warmup", async (c) => {
   const { id } = c.req.param();
-  const { type, taskId } = c.req.valid("json");
   const project = findProjectById(id);
   if (!project) return c.json({ error: "Project not found" }, 404);
 
-  if (type === "project:auto_queue_advanced" && taskId) {
-    broadcast({ type, payload: { id: taskId } });
-  } else {
-    broadcast({ type, payload: project });
-  }
-  log.debug({ projectId: id, type, taskId }, "Project WS broadcast triggered");
-  return c.json({ success: true });
+  log.debug({ projectId: id }, "Warmup status requested");
+  const overview = await buildWarmupOverview(id);
+  return c.json(overview);
 });
+
+// POST /projects/:id/warmup
+projectsRouter.post("/:id/warmup", jsonValidator(warmupCreateSchema), async (c) => {
+  const { id } = c.req.param();
+  const { ttlSeconds } = c.req.valid("json");
+  const project = findProjectById(id);
+  if (!project) return c.json({ error: "Project not found" }, 404);
+
+  if (!getWarmupEnabled()) {
+    log.warn({ projectId: id }, "Rejected warmup create because feature flag is disabled");
+    return c.json({ error: "Warmup is disabled", code: "feature_disabled" }, 403);
+  }
+
+  const targetSupports = await resolveApiWarmupSupports(id);
+  const supportedScopes = supportedWarmupScopes(id, targetSupports);
+  const support =
+    supportedScopes[0]?.support ?? targetSupports[0] ?? (await resolveApiWarmupSupport(id));
+  log.info(
+    {
+      projectId: id,
+      runtimeId: support.runtimeId,
+      providerId: support.providerId,
+      runtimeProfileId: support.runtimeProfileId,
+      transport: support.transport,
+      model: support.model,
+      supported: support.supported,
+      skipReason: support.skipReason ?? null,
+      supportedTargetCount: supportedScopes.length,
+      ttlSeconds,
+    },
+    "Warmup create requested",
+  );
+
+  if (supportedScopes.length === 0) {
+    return c.json(
+      {
+        error: "Warmup is not supported by the project's effective runtime",
+        code: support.skipReason ?? "unsupported_runtime",
+        support,
+        targets: targetSupports,
+      },
+      409,
+    );
+  }
+
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + ttlSeconds * 1000).toISOString();
+  const readyRows: RuntimeWarmupSessionRow[] = [];
+  let firstReady: RuntimeWarmupSessionRow | undefined;
+
+  const activeWarmupPayloads = () =>
+    supportedScopes
+      .map(({ scope }) => findActiveReadyRuntimeWarmupSession(scope))
+      .filter((row): row is RuntimeWarmupSessionRow => Boolean(row))
+      .map((row) => toWarmupPayload(row));
+  const warmupFailureStatus = () => (readyRows.length > 0 ? 207 : 502);
+  const warmupFailureCode = (code: string) =>
+    readyRows.length > 0 ? "partial_warmup_failed" : code;
+  const broadcastWarmupFailure = () => {
+    broadcastWarmupUpdate(id, readyRows.length > 0 ? "partial" : "failed");
+  };
+
+  for (const { support: targetSupport, scope } of supportedScopes) {
+    const pending = createRuntimeWarmupSession({
+      ...scope,
+      ttlSeconds,
+      expiresAt,
+      createdAt: now.toISOString(),
+    });
+    if (!pending) {
+      log.error(
+        { projectId: id, workflowKind: targetSupport.workflowKind },
+        "Failed to create warmup persistence row",
+      );
+      return c.json({ error: "Failed to create warmup" }, 500);
+    }
+
+    try {
+      const { result } = await runApiRuntimeOneShot({
+        projectId: id,
+        projectRoot: project.rootPath,
+        prompt: WARMUP_PROMPT,
+        workflowKind: targetSupport.workflowKind,
+        profileMode: targetSupport.profileMode,
+        usageContext: { source: "warmup" as const },
+        includePartialMessages: false,
+        maxTurns: 1,
+      });
+
+      const seedSessionId = result.sessionId ?? result.session?.id ?? null;
+      if (!seedSessionId) {
+        const failed = markRuntimeWarmupSessionFailed(
+          pending.id,
+          "Runtime did not return a seed session id",
+        );
+        log.warn(
+          {
+            projectId: id,
+            warmupId: pending.id,
+            runtimeId: scope.runtimeId,
+            workflowKind: targetSupport.workflowKind,
+          },
+          "Warmup create failed because runtime did not return a seed session id",
+        );
+        broadcastWarmupFailure();
+        c.status(warmupFailureStatus());
+        return c.json({
+          error: "Runtime did not return a seed session id",
+          code: warmupFailureCode("missing_seed_session"),
+          failedTarget: targetSupport.workflowKind,
+          partial: readyRows.length > 0,
+          warmup: toWarmupPayload(failed),
+          warmups: activeWarmupPayloads(),
+          support,
+          targets: targetSupports,
+        });
+      }
+
+      const ready = markRuntimeWarmupSessionReady(pending.id, {
+        sourceSessionId: seedSessionId,
+        summary: result.outputText || null,
+        expiresAt,
+        ttlSeconds,
+      });
+      if (ready) {
+        readyRows.push(ready);
+        firstReady ??= ready;
+      }
+      log.info(
+        {
+          projectId: id,
+          warmupId: pending.id,
+          runtimeId: scope.runtimeId,
+          runtimeProfileId: scope.runtimeProfileId,
+          workflowKind: targetSupport.workflowKind,
+          profileMode: targetSupport.profileMode,
+          ttlSeconds,
+          expiresAt,
+        },
+        "Warmup create succeeded",
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const failed = markRuntimeWarmupSessionFailed(pending.id, message);
+      log.warn(
+        {
+          projectId: id,
+          warmupId: pending.id,
+          runtimeId: scope.runtimeId,
+          workflowKind: targetSupport.workflowKind,
+          err: error,
+        },
+        "Warmup create failed during runtime execution",
+      );
+      broadcastWarmupFailure();
+      c.status(warmupFailureStatus());
+      return c.json({
+        error: message,
+        code: warmupFailureCode("runtime_failed"),
+        failedTarget: targetSupport.workflowKind,
+        partial: readyRows.length > 0,
+        warmup: toWarmupPayload(failed),
+        warmups: activeWarmupPayloads(),
+        support,
+        targets: targetSupports,
+      });
+    }
+  }
+
+  broadcastWarmupUpdate(id, "ready");
+  return c.json(
+    {
+      enabled: true,
+      support,
+      targets: targetSupports,
+      warmup: toWarmupPayload(firstReady),
+      warmups: readyRows.map((row) => toWarmupPayload(row)),
+    },
+    201,
+  );
+});
+
+// DELETE /projects/:id/warmup
+projectsRouter.delete("/:id/warmup", async (c) => {
+  const { id } = c.req.param();
+  const project = findProjectById(id);
+  if (!project) return c.json({ error: "Project not found" }, 404);
+
+  const targetSupports = await resolveApiWarmupSupports(id);
+  const supportedScopes = supportedWarmupScopes(id, targetSupports);
+  const support =
+    supportedScopes[0]?.support ?? targetSupports[0] ?? (await resolveApiWarmupSupport(id));
+  const cleared = supportedScopes.reduce(
+    (count, { scope }) => count + clearActiveRuntimeWarmupSessions(scope),
+    0,
+  );
+  log.info(
+    {
+      projectId: id,
+      runtimeId: support.runtimeId,
+      runtimeProfileId: support.runtimeProfileId,
+      supportedTargetCount: supportedScopes.length,
+      cleared,
+    },
+    "Warmup cleared",
+  );
+  if (cleared > 0) {
+    broadcastWarmupUpdate(id, "cleared");
+  }
+  return c.json({ success: true, cleared });
+});
+
+// POST /projects/:id/broadcast — emit project-scoped WS event (used by agent coordinator)
+projectsRouter.post(
+  "/:id/broadcast",
+  internalBroadcastAuth,
+  jsonValidator(broadcastProjectSchema),
+  async (c) => {
+    const { id } = c.req.param();
+    const { type, taskId, runtimeProfileId } = c.req.valid("json");
+    const project = findProjectById(id);
+    if (!project) return c.json({ error: "Project not found" }, 404);
+
+    if (type === "project:auto_queue_advanced" && taskId) {
+      const task = findTaskById(taskId);
+      if (!task || task.projectId !== id) {
+        return c.json({ error: "taskId does not belong to the target project" }, 400);
+      }
+    }
+
+    if (type === "project:runtime_limit_updated" && !runtimeProfileId) {
+      return c.json(
+        { error: "runtimeProfileId is required for project:runtime_limit_updated" },
+        400,
+      );
+    }
+
+    if (type === "project:runtime_limit_updated" && runtimeProfileId) {
+      const runtimeProfile = findRuntimeProfileById(runtimeProfileId);
+      const belongsToProject =
+        runtimeProfile?.projectId === id || runtimeProfile?.projectId == null;
+      if (!runtimeProfile || !belongsToProject) {
+        return c.json(
+          { error: "runtimeProfileId must belong to the target project or be global" },
+          400,
+        );
+      }
+    }
+
+    if (type === "project:auto_queue_advanced" && taskId) {
+      broadcast({ type, payload: { id: taskId } });
+    } else if (type === "project:runtime_limit_updated") {
+      broadcast({
+        type,
+        payload: {
+          projectId: id,
+          runtimeProfileId: runtimeProfileId ?? null,
+          taskId: taskId ?? null,
+        },
+      });
+    } else {
+      broadcast({ type, payload: project });
+    }
+    log.debug(
+      { projectId: id, type, taskId: taskId ?? null, runtimeProfileId: runtimeProfileId ?? null },
+      "Project WS broadcast triggered",
+    );
+    return c.json({ success: true });
+  },
+);
 
 // DELETE /projects/:id
 projectsRouter.delete("/:id", (c) => {
@@ -270,7 +737,7 @@ async function runRoadmapGenerationJob(
     for (const taskId of result.taskIds) {
       const task = findTaskById(taskId);
       if (task) {
-        broadcast({ type: "task:created", payload: toTaskResponse(task) });
+        broadcast({ type: "task:created", payload: toTaskBroadcastPayload(task) });
       }
     }
 

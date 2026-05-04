@@ -33,6 +33,23 @@ export const projects = sqliteTable("projects", {
 export type ProjectRow = typeof projects.$inferSelect;
 export type NewProjectRow = typeof projects.$inferInsert;
 
+export const appSettings = sqliteTable("app_settings", {
+  id: integer("id").primaryKey().notNull().default(1),
+  defaultTaskRuntimeProfileId: text("default_task_runtime_profile_id"),
+  defaultPlanRuntimeProfileId: text("default_plan_runtime_profile_id"),
+  defaultReviewRuntimeProfileId: text("default_review_runtime_profile_id"),
+  defaultChatRuntimeProfileId: text("default_chat_runtime_profile_id"),
+  createdAt: text("created_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+  updatedAt: text("updated_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+});
+
+export type AppSettingsRow = typeof appSettings.$inferSelect;
+export type NewAppSettingsRow = typeof appSettings.$inferInsert;
+
 export const tasks = sqliteTable("tasks", {
   id: text("id")
     .primaryKey()
@@ -48,7 +65,7 @@ export const tasks = sqliteTable("tasks", {
   planDocs: integer("plan_docs", { mode: "boolean" }).notNull().default(false),
   planTests: integer("plan_tests", { mode: "boolean" }).notNull().default(false),
   skipReview: integer("skip_review", { mode: "boolean" }).notNull().default(false),
-  useSubagents: integer("use_subagents", { mode: "boolean" }).notNull().default(true),
+  useSubagents: integer("use_subagents", { mode: "boolean" }).notNull().default(false),
   status: text("status").$type<TaskStatus>().notNull().default("backlog"),
   priority: integer("priority").notNull().default(0),
   position: real("position").notNull().default(1000.0),
@@ -80,9 +97,13 @@ export const tasks = sqliteTable("tasks", {
   modelOverride: text("model_override"),
   runtimeOptionsJson: text("runtime_options_json"),
   sessionId: text("session_id"),
+  runtimeLimitSnapshotJson: text("runtime_limit_snapshot_json"),
+  runtimeLimitUpdatedAt: text("runtime_limit_updated_at"),
   lockedBy: text("locked_by"),
   lockedUntil: text("locked_until"),
   scheduledAt: text("scheduled_at"),
+  branchName: text("branch_name"),
+  worktreePath: text("worktree_path"),
   createdAt: text("created_at")
     .notNull()
     .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
@@ -125,6 +146,8 @@ export const runtimeProfiles = sqliteTable("runtime_profiles", {
   headersJson: text("headers_json").notNull().default("{}"),
   optionsJson: text("options_json").notNull().default("{}"),
   enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+  runtimeLimitSnapshotJson: text("runtime_limit_snapshot_json"),
+  runtimeLimitUpdatedAt: text("runtime_limit_updated_at"),
   createdAt: text("created_at")
     .notNull()
     .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
@@ -210,3 +233,151 @@ export const usageEvents = sqliteTable("usage_events", {
 
 export type UsageEventRow = typeof usageEvents.$inferSelect;
 export type NewUsageEventRow = typeof usageEvents.$inferInsert;
+
+export type RuntimeWarmupSessionStatus = "creating" | "ready" | "failed" | "cleared" | "expired";
+
+/**
+ * Reusable seed sessions created ahead of task execution. A ready row can be
+ * forked by compatible runtimes until its TTL expires or a newer warmup
+ * clears it for the same runtime/profile/model scope.
+ */
+export const runtimeWarmupSessions = sqliteTable("runtime_warmup_sessions", {
+  id: text("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  projectId: text("project_id").notNull(),
+  runtimeProfileId: text("runtime_profile_id"),
+  runtimeId: text("runtime_id").notNull(),
+  providerId: text("provider_id").notNull(),
+  transport: text("transport"),
+  model: text("model"),
+  sourceSessionId: text("source_session_id"),
+  status: text("status").$type<RuntimeWarmupSessionStatus>().notNull().default("creating"),
+  ttlSeconds: integer("ttl_seconds").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  summary: text("summary"),
+  errorMessage: text("error_message"),
+  createdAt: text("created_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+  updatedAt: text("updated_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+});
+
+export type RuntimeWarmupSessionRow = typeof runtimeWarmupSessions.$inferSelect;
+export type NewRuntimeWarmupSessionRow = typeof runtimeWarmupSessions.$inferInsert;
+
+/**
+ * Rebuildable Codex session index used by hot request paths.
+ * Source of truth stays on disk (~/.codex/sessions/*.jsonl).
+ */
+export const codexSessions = sqliteTable("codex_sessions", {
+  sessionId: text("session_id").primaryKey(),
+  filePath: text("file_path").notNull().unique(),
+  title: text("title"),
+  projectRoot: text("project_root"),
+  accountFingerprint: text("account_fingerprint"),
+  sourceCreatedAt: text("source_created_at"),
+  sourceUpdatedAt: text("source_updated_at"),
+  messageCount: integer("message_count").notNull().default(0),
+  previewText: text("preview_text"),
+  sizeBytes: integer("size_bytes").notNull().default(0),
+  mtimeMs: integer("mtime_ms").notNull().default(0),
+  lastIndexedAt: text("last_indexed_at").notNull(),
+  createdAt: text("created_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+  updatedAt: text("updated_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+});
+
+export type CodexSessionRow = typeof codexSessions.$inferSelect;
+export type NewCodexSessionRow = typeof codexSessions.$inferInsert;
+
+/**
+ * Tracks file-level dirtiness/cursors for Codex session reconcile passes.
+ */
+export const codexSessionFiles = sqliteTable("codex_session_files", {
+  filePath: text("file_path").primaryKey(),
+  sessionId: text("session_id"),
+  sizeBytes: integer("size_bytes").notNull().default(0),
+  mtimeMs: integer("mtime_ms").notNull().default(0),
+  parsedOffset: integer("parsed_offset").notNull().default(0),
+  pendingTail: text("pending_tail").notNull().default(""),
+  missing: integer("missing", { mode: "boolean" }).notNull().default(false),
+  importVersion: integer("import_version").notNull().default(1),
+  lastSeenAt: text("last_seen_at").notNull(),
+  createdAt: text("created_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+  updatedAt: text("updated_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+});
+
+export type CodexSessionFileRow = typeof codexSessionFiles.$inferSelect;
+export type NewCodexSessionFileRow = typeof codexSessionFiles.$inferInsert;
+
+/**
+ * Latest known Codex usage-limit snapshot per account/project/limit scope.
+ */
+export const codexLimitHeads = sqliteTable("codex_limit_heads", {
+  headKey: text("head_key").primaryKey(),
+  accountFingerprint: text("account_fingerprint").notNull(),
+  projectRoot: text("project_root"),
+  limitId: text("limit_id").notNull(),
+  model: text("model"),
+  source: text("source").notNull().default("codex"),
+  snapshotJson: text("snapshot_json").notNull(),
+  observedAt: text("observed_at").notNull(),
+  sessionId: text("session_id"),
+  filePath: text("file_path"),
+  createdAt: text("created_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+  updatedAt: text("updated_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+});
+
+export type CodexLimitHeadRow = typeof codexLimitHeads.$inferSelect;
+export type NewCodexLimitHeadRow = typeof codexLimitHeads.$inferInsert;
+
+/**
+ * Bounded recent Codex limit snapshots used for diagnostics/history.
+ */
+export const codexLimitHistory = sqliteTable("codex_limit_history", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  headKey: text("head_key").notNull(),
+  accountFingerprint: text("account_fingerprint").notNull(),
+  projectRoot: text("project_root"),
+  limitId: text("limit_id").notNull(),
+  model: text("model"),
+  snapshotJson: text("snapshot_json").notNull(),
+  observedAt: text("observed_at").notNull(),
+  sessionId: text("session_id"),
+  filePath: text("file_path"),
+  createdAt: text("created_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+});
+
+export type CodexLimitHistoryRow = typeof codexLimitHistory.$inferSelect;
+export type NewCodexLimitHistoryRow = typeof codexLimitHistory.$inferInsert;
+
+/**
+ * Generic index cursor/watermark state for Codex reconcile pipeline.
+ */
+export const codexIndexCursors = sqliteTable("codex_index_cursors", {
+  cursorKey: text("cursor_key").primaryKey(),
+  cursorValue: text("cursor_value"),
+  cursorJson: text("cursor_json"),
+  updatedAt: text("updated_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+});
+
+export type CodexIndexCursorRow = typeof codexIndexCursors.$inferSelect;
+export type NewCodexIndexCursorRow = typeof codexIndexCursors.$inferInsert;

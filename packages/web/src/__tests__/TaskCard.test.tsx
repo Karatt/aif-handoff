@@ -27,6 +27,8 @@ const mockTask: Task = {
   lastSyncedAt: null,
   sessionId: null,
   scheduledAt: null,
+  branchName: null,
+  worktreePath: null,
   roadmapAlias: null,
   tags: [],
   status: "backlog",
@@ -88,6 +90,39 @@ describe("TaskCard", () => {
 
     expect(screen.getByText("Manual Review")).toBeDefined();
     expect(screen.getByText("Auto-review stopped. Human review required.")).toBeDefined();
+  });
+
+  it("should render structured runtime auto-pause messaging for blocked tasks", () => {
+    render(
+      <TaskCard
+        task={{
+          ...mockTask,
+          status: "blocked_external",
+          retryAfter: "2026-04-17T01:00:00.000Z",
+          runtimeLimitSnapshot: {
+            source: "api_headers",
+            status: "blocked",
+            precision: "exact",
+            checkedAt: "2026-04-17T00:00:00.000Z",
+            providerId: "anthropic",
+            runtimeId: "claude",
+            primaryScope: "requests",
+            resetAt: "2099-04-17T01:00:00.000Z",
+            warningThreshold: 10,
+            windows: [{ scope: "requests", percentRemaining: 5, warningThreshold: 10 }],
+            providerMeta: null,
+          },
+        }}
+        onClick={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Runtime auto-pause")).toBeDefined();
+    expect(
+      screen.getByText("Request quota crossed the 10% safety threshold (5% remaining)."),
+    ).toBeDefined();
+    expect(screen.getByText(/Provider reset/)).toBeDefined();
+    expect(screen.getByText(/Task retry .*scheduled/)).toBeDefined();
   });
 
   describe("scheduled banner", () => {

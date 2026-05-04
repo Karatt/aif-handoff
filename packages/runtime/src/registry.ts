@@ -1,3 +1,4 @@
+import { getProjectConfig } from "@aif/shared";
 import {
   RuntimeExecutionError,
   RuntimeModuleLoadError,
@@ -5,6 +6,7 @@ import {
   RuntimeRegistrationError,
   RuntimeResolutionError,
 } from "./errors.js";
+import { buildLanguageDirective } from "./languagePolicy.js";
 import { resolveRuntimeModuleRegistrar } from "./module.js";
 import { transformSkillCommandPrefix } from "./promptPolicy.js";
 import {
@@ -14,6 +16,7 @@ import {
   type RuntimeDescriptor,
   type RuntimeRunInput,
   type RuntimeRunResult,
+  type RuntimeSessionForkInput,
 } from "./types.js";
 import { createNoopUsageSink, type RuntimeUsageSink } from "./usageSink.js";
 
@@ -43,7 +46,7 @@ export interface RuntimeRegistryOptions {
 function createFallbackLogger(): RuntimeRegistryLogger {
   return {
     debug(context, message) {
-      console.debug("DEBUG [runtime-registry]", message, context);
+      console.debug("[runtime-registry]", message, context);
     },
     warn(context, message) {
       console.warn("WARN [runtime-module]", message, context);
@@ -82,6 +85,66 @@ function wrapAdapter(
   function transformPrompt(input: RuntimeRunInput): RuntimeRunInput {
     if (!needsPromptTransform) return input;
     return { ...input, prompt: transformSkillCommandPrefix(input.prompt, prefix!) };
+  }
+
+  /**
+   * Inject a project-language directive into `execution.systemPromptAppend`.
+   *
+   * Covers every AI-backed call that flows through the registry — subagents,
+   * roadmap generation, commit generation, fast fix, chat, reviewGate — so the
+   * project's `language.artifacts` setting reaches the model without each call
+   * site having to remember to forward it.
+   *
+   * The directive is appended AFTER any existing `systemPromptAppend` so scope
+   * rules (project-scope, review-diff-scope) keep their visual emphasis. When
+   * `artifacts` is empty or `en`, the directive is empty and the input is
+   * returned unchanged. Failures in reading the config are swallowed (logged
+   * as WARN) because a language hint must never break `run()`.
+   */
+  function applyLanguageDirective(input: RuntimeRunInput): RuntimeRunInput {
+    const projectRoot = input.projectRoot;
+    if (!projectRoot) return input;
+
+    let directive = "";
+    try {
+      const cfg = getProjectConfig(projectRoot);
+      directive = buildLanguageDirective({
+        artifacts: cfg.language.artifacts,
+        technicalTerms: cfg.language.technical_terms,
+      });
+    } catch (error) {
+      log.warn(
+        {
+          runtimeId: adapter.descriptor.id,
+          projectRoot,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        "Failed to resolve project language config — skipping language directive injection",
+      );
+      return input;
+    }
+
+    if (!directive) return input;
+
+    const existing = input.execution?.systemPromptAppend ?? "";
+    const merged = existing ? `${existing}\n\n${directive}` : directive;
+
+    log.debug(
+      {
+        runtimeId: adapter.descriptor.id,
+        projectRoot,
+        artifactsLength: merged.length,
+      },
+      "Injected project language directive into systemPromptAppend",
+    );
+
+    return {
+      ...input,
+      execution: {
+        ...input.execution,
+        systemPromptAppend: merged,
+      },
+    };
   }
 
   function recordUsage(input: RuntimeRunInput, result: RuntimeRunResult): void {
@@ -164,7 +227,7 @@ function wrapAdapter(
   }
 
   async function wrappedRun(input: RuntimeRunInput): Promise<RuntimeRunResult> {
-    const transformed = transformPrompt(input);
+    const transformed = applyLanguageDirective(transformPrompt(input));
     const result = await adapter.run(transformed);
     recordUsage(transformed, result);
     return result;
@@ -178,8 +241,22 @@ function wrapAdapter(
         `Runtime "${adapter.descriptor.id}" does not implement resume()`,
       );
     }
-    const transformed = transformPrompt(input) as RuntimeRunInput & { sessionId: string };
+    const transformed = applyLanguageDirective(transformPrompt(input)) as RuntimeRunInput & {
+      sessionId: string;
+    };
     const result = await adapter.resume(transformed);
+    recordUsage(transformed, result);
+    return result;
+  }
+
+  async function wrappedForkSession(input: RuntimeSessionForkInput): Promise<RuntimeRunResult> {
+    if (!adapter.forkSession) {
+      throw new RuntimeExecutionError(
+        `Runtime "${adapter.descriptor.id}" does not implement forkSession()`,
+      );
+    }
+    const transformed = applyLanguageDirective(transformPrompt(input)) as RuntimeSessionForkInput;
+    const result = await adapter.forkSession(transformed);
     recordUsage(transformed, result);
     return result;
   }
@@ -188,6 +265,7 @@ function wrapAdapter(
     ...adapter,
     run: wrappedRun,
     resume: adapter.resume ? wrappedResume : undefined,
+    forkSession: adapter.forkSession ? wrappedForkSession : undefined,
   };
 }
 

@@ -14,7 +14,7 @@ Autonomous task management system with Kanban board and AI subagents. Tasks flow
 - **Runtime Abstraction:** `@aif/runtime` workspace (runtime/provider contracts + registry)
 - **Database:** SQLite (better-sqlite3 + drizzle-orm)
 - **Frontend:** React 19 + Vite + TailwindCSS 4
-- **Runtime:** Pluggable adapter system (`@aif/runtime`) — built-in Claude (Agent SDK) + Codex (CLI/API) + OpenRouter (API) adapters
+- **Runtime:** Pluggable adapter system (`@aif/runtime`) — built-in Claude (Agent SDK) + Codex (SDK/CLI/API) + OpenRouter (API) adapters
 - **Agent:** Runtime-neutral coordinator + node-cron
 - **Testing:** Vitest
 
@@ -60,7 +60,7 @@ packages/
 │   └── src/
 │       ├── index.ts         # Server entry point
 │       ├── routes/          # tasks.ts, projects.ts, chat.ts, runtimeProfiles.ts
-│       ├── services/        # runtime.ts, fastFix.ts, roadmapGeneration.ts
+│       ├── services/        # runtime.ts, codexIndex.ts, fastFix.ts, roadmapGeneration.ts
 │       ├── middleware/      # logger.ts, rateLimit.ts, zodValidator.ts
 │       ├── schemas.ts       # Zod request validation
 │       └── ws.ts            # WebSocket handler
@@ -85,6 +85,7 @@ packages/
         ├── hooks.ts         # Activity logging, project root
         ├── stderrCollector.ts # Generic stderr ring-buffer
         ├── notifier.ts      # Notification system
+        ├── codex/           # Codex login broker (OAuth-in-Docker bridge)
         └── subagents/       # planner.ts, implementer.ts, reviewer.ts
 
 .claude/agents/          # Agent definitions (loaded by runtimes that support them)
@@ -109,13 +110,14 @@ data/                    # SQLite database files (gitignored)
 
 ## Documentation
 
-| Document        | Path                    | Description                              |
-| --------------- | ----------------------- | ---------------------------------------- |
-| README          | README.md               | Project landing page                     |
-| Getting Started | docs/getting-started.md | Installation, setup, first steps         |
-| Architecture    | docs/architecture.md    | Agent pipeline, state machine, data flow |
-| API Reference   | docs/api.md             | REST endpoints, WebSocket events         |
-| Configuration   | docs/configuration.md   | Environment variables, logging, auth     |
+| Document        | Path                    | Description                               |
+| --------------- | ----------------------- | ----------------------------------------- |
+| README          | README.md               | Project landing page                      |
+| Getting Started | docs/getting-started.md | Installation, setup, first steps          |
+| Architecture    | docs/architecture.md    | Agent pipeline, state machine, data flow  |
+| API Reference   | docs/api.md             | REST endpoints, WebSocket events          |
+| Configuration   | docs/configuration.md   | Environment variables, logging, auth      |
+| Providers       | docs/providers.md       | Runtime profiles and adapter capabilities |
 
 ## AI Context Files
 
@@ -146,6 +148,8 @@ data/                    # SQLite database files (gitignored)
 - **Pencil sync required for new components.** If a new UI component is genuinely needed, its design must be synced with the Pencil design system (`.pen` files) using the `pencil` MCP tools (`batch_design`, `get_guidelines`). Never add a visual component to the codebase without a corresponding Pencil representation.
 - **UI primitives live in `packages/web/src/components/ui/`.** Domain-specific compositions belong in their feature folder (e.g. `components/task/`, `components/kanban/`).
 - **No expensive CSS properties.** Never use `box-shadow`, `backdrop-filter`, `filter: blur()`, `text-shadow`, or other GPU/paint-heavy CSS in components. These trigger costly compositing and repaint cycles, especially on low-end devices and during scroll/animation. Use `border`, `outline`, `opacity`, or solid `background-color` as lightweight alternatives.
+- **Theme color pairing → see [`docs/ui-theme-colors.md`](docs/ui-theme-colors.md).** Pairing rules between semantic tokens and fixed-color backgrounds, the verification checklist (light + dark), and known cases live there. Read it before touching color classes on any UI.
+- **If you fix a theme-readability bug, append to `docs/ui-theme-colors.md` → "Learnings".** Whenever a change adjusts colors to fix contrast/legibility in a theme (light or dark), add a one- or two-line dated entry with the symptom, cause, and fix. This keeps the doc the single living memory of theme-pairing pitfalls so the same class of bug does not recur.
 
 ## Docker Sync Rule
 
@@ -163,6 +167,20 @@ data/                    # SQLite database files (gitignored)
   - `.docker/Dockerfile` — add any new system-level dependencies.
   - **Usage reporting contract** — declare `capabilities.usageReporting` (`FULL` / `PARTIAL` / `NONE`) and return `RuntimeRunResult.usage` as `RuntimeUsage` or explicit `null`. The discovery test in `bootstrap.test.ts` fails the build if the field is missing.
 - **Cross-adapter consistency on shared changes.** When modifying shared runtime infrastructure (`errors.ts`, `types.ts`, `timeouts.ts`, `capabilities.ts`) or refactoring a pattern that exists across multiple adapters — enumerate ALL adapter directories under `packages/runtime/src/adapters/` and verify each is updated. Do not rely on the issue description or plan to list affected adapters — scan the directory.
+
+## Migration Version Rule
+
+- **Migration versions are append-only — never renumber or edit a merged migration.** In `packages/shared/src/db.ts` `MIGRATIONS` array, never change the `version` number or `sql` body of a migration that has already landed on `main`. If a feature branch collides on a version with `main` during merge, append the new migration at the next free slot — do NOT reuse or reorder existing version numbers.
+  - **Why:** user databases store progress via `PRAGMA user_version`. If version N is already applied and the SQL behind N is later swapped for different content, `runMigrations` filters `m.version > currentVersion` and silently skips the new content on those DBs. Result: schema drift between code and DB — missing columns, crashes at query time (see v13 runtime_limit snapshot incident).
+  - **When resolving merge conflicts in `MIGRATIONS`:** keep the first-merged entry at its original version; move the conflicting second entry to a new trailing version. Do not "reconcile" by editing either slot.
+  - **Writing a recovery migration:** `ALTER TABLE ADD COLUMN` statements are idempotent via `isIgnorableMigrationError` (duplicate column → swallowed). Safe to re-issue the same DDL in a later version to backfill DBs that skipped it.
+
+## Nullable Cast Rule
+
+- **Never use `as T` to strip a nullable return.** Helpers like `asRecord(x)`, `JSON.parse` wrappers, and other `unknown → T | null` narrowing functions can legitimately return `null`. Writing `const r = asRecord(x) as T` silently drops `| null` from the type, the TypeScript checker goes quiet, and subsequent `r.foo` access crashes at runtime on real-world nullable inputs.
+  - **Always declare the union explicitly:** `as T | null` (or skip the cast entirely).
+  - **Always guard before access:** `if (!r) return null` immediately after the cast.
+  - **Applies to all adapter parsers** that walk untrusted payloads (Codex session JSONL, Claude stream events, OpenRouter responses) — a missing/null field is normal, not exceptional.
 
 ## Structured Error Classification Rule
 

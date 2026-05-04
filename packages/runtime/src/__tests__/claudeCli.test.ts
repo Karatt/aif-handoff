@@ -111,6 +111,14 @@ function getSpawnInvocation() {
 describe("runClaudeCli", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 503,
+        json: vi.fn().mockResolvedValue({}),
+      }),
+    );
     mockChild.on.mockReset();
     mockStdout.on.mockReset();
     mockStderr.on.mockReset();
@@ -121,6 +129,7 @@ describe("runClaudeCli", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -162,6 +171,84 @@ describe("runClaudeCli", () => {
     expect(mockStdin.write).toHaveBeenCalledWith("Implement the feature");
     expect(mockStdin.end).toHaveBeenCalled();
     expect(spawnOptions).toEqual(expect.objectContaining({ cwd: "/tmp/project" }));
+  });
+
+  it("fails fast when Claude CLI reports a blocked rate limit event", async () => {
+    const resetAt = new Date(1_800_000_000 * 1000).toISOString();
+    const input = createInput({ profileId: "profile-1" });
+    const promise = runClaudeCli(input);
+
+    simulateStreamAndClose(1, [
+      {
+        type: "rate_limit_event",
+        rate_limit_info: {
+          status: "allowed",
+          overageStatus: "rejected",
+          overageResetsAt: 1_800_000_000,
+          rateLimitType: "overage",
+          isUsingOverage: false,
+        },
+      },
+    ]);
+
+    await expect(promise).rejects.toMatchObject({
+      name: "ClaudeRuntimeAdapterError",
+      category: "rate_limit",
+      adapterCode: "CLAUDE_USAGE_LIMIT",
+      resetAt,
+    });
+    expect(mockChild.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("emits a tool:question event alongside tool:use for AskUserQuestion", async () => {
+    const onEvent = vi.fn();
+    const input = createInput({ execution: { onEvent } });
+    const promise = runClaudeCli(input);
+
+    simulateStreamAndClose(0, [
+      { type: "system", subtype: "init", session_id: "sess-q", model: "claude-haiku" },
+      {
+        type: "assistant",
+        session_id: "sess-q",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              id: "tool-abc",
+              name: "AskUserQuestion",
+              input: {
+                questions: [
+                  {
+                    question: "Choose mode",
+                    options: [{ label: "Fast" }, { label: "Full" }],
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      },
+      {
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        session_id: "sess-q",
+        result: "",
+        num_turns: 1,
+        duration_ms: 10,
+      },
+    ]);
+
+    await promise;
+
+    const questionEvents = onEvent.mock.calls
+      .map(
+        (call) => call[0] as { type: string; data?: { toolUseId?: string; questions?: unknown[] } },
+      )
+      .filter((event) => event.type === "tool:question");
+    expect(questionEvents.length).toBe(1);
+    expect(questionEvents[0].data?.toolUseId).toBe("tool-abc");
+    expect(questionEvents[0].data?.questions).toHaveLength(1);
   });
 
   it("passes very large prompts via stdin without putting them on argv", async () => {
@@ -357,6 +444,32 @@ describe("runClaudeCli", () => {
     const { cliArgs } = getSpawnInvocation();
     expect(cliArgs).toContain("--resume");
     expect(cliArgs).toContain("sess-existing");
+  });
+
+  it("includes --fork-session with source session id for forked runs", async () => {
+    const input = createInput({ sourceSessionId: "sess-warm-source" } as Partial<RuntimeRunInput>);
+    const promise = runClaudeCli(input);
+
+    simulateStreamAndClose(0, successfulStream({ sessionId: "sess-child", text: "Forked" }));
+
+    const result = await promise;
+
+    const { cliArgs } = getSpawnInvocation();
+    expect(cliArgs).toContain("--resume");
+    expect(cliArgs[cliArgs.indexOf("--resume") + 1]).toBe("sess-warm-source");
+    expect(cliArgs).toContain("--fork-session");
+    expect(result.sessionId).toBe("sess-child");
+  });
+
+  it("does not fall back to the source session id when fork output has no child session id", async () => {
+    const input = createInput({ sourceSessionId: "sess-warm-source" } as Partial<RuntimeRunInput>);
+    const promise = runClaudeCli(input);
+
+    simulateStreamAndClose(0, [{ type: "result", subtype: "success", result: "Forked" }]);
+
+    const result = await promise;
+
+    expect(result.sessionId).toBeNull();
   });
 
   it("includes --include-partial-messages when execution.includePartialMessages is true", async () => {

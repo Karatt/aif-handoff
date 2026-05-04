@@ -59,13 +59,59 @@ Returns frontend-visible defaults and runtime readiness metadata.
 
 ```json
 {
-  "useSubagents": true,
+  "useSubagents": false,
   "maxReviewIterations": 3,
-  "autoReviewStrategy": "full_re_review"
+  "autoReviewStrategy": "full_re_review",
+  "runtimeReadiness": {
+    "availableRuntimeCount": 3,
+    "runtimeProfileCount": 6,
+    "enabledRuntimeProfileCount": 5
+  },
+  "runtimeDefaults": {
+    "modules": [],
+    "openAiBaseUrlConfigured": false,
+    "codexCliPathConfigured": true,
+    "app": {
+      "defaultTaskRuntimeProfileId": "uuid-or-null",
+      "defaultPlanRuntimeProfileId": null,
+      "defaultReviewRuntimeProfileId": null,
+      "defaultChatRuntimeProfileId": "uuid-or-null",
+      "resolvedDefaultTaskRuntimeProfileId": "uuid-or-null",
+      "resolvedDefaultPlanRuntimeProfileId": "uuid-or-null",
+      "resolvedDefaultReviewRuntimeProfileId": "uuid-or-null",
+      "resolvedDefaultChatRuntimeProfileId": "uuid-or-null"
+    }
+  }
 }
 ```
 
 `autoReviewStrategy` is the resolved global auto-review mode (`full_re_review` or `closure_first`).
+
+### App Runtime Defaults
+
+```
+GET /settings/runtime-defaults
+PUT /settings/runtime-defaults
+```
+
+Reads or updates the app-wide runtime defaults used after project defaults and before environment fallback.
+
+**PUT body:**
+
+```json
+{
+  "defaultTaskRuntimeProfileId": "uuid-or-null",
+  "defaultPlanRuntimeProfileId": "uuid-or-null",
+  "defaultReviewRuntimeProfileId": "uuid-or-null",
+  "defaultChatRuntimeProfileId": "uuid-or-null"
+}
+```
+
+Rules:
+
+- values must be `null` or enabled global runtime profiles
+- `plan` / `review` fall back to the app task default when unset
+- invalid scope combinations fail with `400` and `fieldErrors`
 
 ## Projects
 
@@ -108,6 +154,10 @@ POST /projects
 | `planCheckerMaxBudgetUsd` | number | no | Budget for plan-checker agent. If omitted, unlimited |
 | `implementerMaxBudgetUsd` | number | no | Budget for implementer agent. If omitted, unlimited |
 | `reviewSidecarMaxBudgetUsd` | number | no | Per-sidecar budget for review/security sidecars. If omitted, unlimited |
+| `defaultTaskRuntimeProfileId` | string\|null | no | Project-level task/implementation runtime default |
+| `defaultPlanRuntimeProfileId` | string\|null | no | Project-level planning runtime default |
+| `defaultReviewRuntimeProfileId` | string\|null | no | Project-level review runtime default |
+| `defaultChatRuntimeProfileId` | string\|null | no | Project-level chat runtime default |
 
 **Response:** `201 Created` — the created project object.
 
@@ -120,6 +170,10 @@ PUT /projects/:id
 **Body:** Same as Create Project.
 
 **Response:** `200 OK` — the updated project object.
+
+Parallel auto-queue with `git.create_branches=true` requires
+`AIF_TASK_WORKTREES_ENABLED=true`. With the default `false`, the API rejects
+that combination and the coordinator keeps branch-isolated projects serial.
 
 ### Check Roadmap Status
 
@@ -227,6 +281,171 @@ clients can update their board indicator.
 { "enabled": true }
 ```
 
+Parallel auto-queue with `git.create_branches=true` requires
+`AIF_TASK_WORKTREES_ENABLED=true`. Queued full-mode tasks then receive isolated
+git worktrees when planning starts.
+
+### Get Project Warmup State
+
+```
+GET /projects/:id/warmup
+```
+
+Returns the feature flag state, warmup support metadata for the project's
+effective planner, implementer, and review runtimes, and active ready warmup
+sessions if they exist. The response never includes raw seed session ids.
+
+**Response:** `200 OK`
+
+```json
+{
+  "enabled": true,
+  "support": {
+    "supported": true,
+    "skipReason": null,
+    "workflowKind": "planner",
+    "profileMode": "plan",
+    "runtimeId": "claude",
+    "providerId": "anthropic",
+    "runtimeProfileId": "profile-1",
+    "transport": "sdk",
+    "model": "claude-sonnet-4",
+    "selectionSource": "project_default"
+  },
+  "targets": [
+    {
+      "supported": true,
+      "skipReason": null,
+      "workflowKind": "planner",
+      "profileMode": "plan",
+      "runtimeId": "claude",
+      "providerId": "anthropic",
+      "runtimeProfileId": "profile-1",
+      "transport": "sdk",
+      "model": "claude-sonnet-4",
+      "selectionSource": "project_default"
+    }
+  ],
+  "warmup": {
+    "id": "warmup-1",
+    "projectId": "project-1",
+    "runtimeProfileId": "profile-1",
+    "runtimeId": "claude",
+    "providerId": "anthropic",
+    "transport": "sdk",
+    "model": "claude-sonnet-4",
+    "status": "ready",
+    "ttlSeconds": 3600,
+    "expiresAt": "2026-04-30T12:00:00.000Z",
+    "remainingSeconds": 2400,
+    "summary": "Warmup summary",
+    "errorMessage": null,
+    "createdAt": "2026-04-30T11:00:00.000Z",
+    "updatedAt": "2026-04-30T11:00:10.000Z"
+  },
+  "warmups": [
+    {
+      "id": "warmup-1",
+      "projectId": "project-1",
+      "runtimeProfileId": "profile-1",
+      "runtimeId": "claude",
+      "providerId": "anthropic",
+      "transport": "sdk",
+      "model": "claude-sonnet-4",
+      "status": "ready",
+      "ttlSeconds": 3600,
+      "expiresAt": "2026-04-30T12:00:00.000Z",
+      "remainingSeconds": 2400,
+      "summary": "Warmup summary",
+      "errorMessage": null,
+      "createdAt": "2026-04-30T11:00:00.000Z",
+      "updatedAt": "2026-04-30T11:00:10.000Z"
+    }
+  ]
+}
+```
+
+### Create Project Warmup
+
+```
+POST /projects/:id/warmup
+```
+
+Creates reusable seed sessions for each distinct effective warmup-capable
+planner, implementer, and review runtime. Requires `AIF_WARMUP_ENABLED=true`
+and a runtime transport that advertises session fork support. TTL is bounded to
+60–86400 seconds.
+
+**Body:**
+
+```json
+{ "ttlSeconds": 3600 }
+```
+
+**Response:** `201 Created`
+
+Returns the same shape as `GET /projects/:id/warmup`.
+
+If at least one target warmup is created successfully and a later target fails,
+the endpoint returns `207 Multi-Status` with the active successful or previously
+ready warmups instead of treating the whole request as a cold failure:
+
+```json
+{
+  "error": "Runtime failed while creating warmup",
+  "code": "partial_warmup_failed",
+  "failedTarget": "implementer",
+  "partial": true,
+  "warmup": {
+    "id": "warmup-failed",
+    "status": "failed"
+  },
+  "warmups": [
+    {
+      "id": "warmup-ready",
+      "status": "ready"
+    }
+  ],
+  "support": {
+    "supported": true,
+    "workflowKind": "planner"
+  },
+  "targets": []
+}
+```
+
+Clients should treat `warmups` in a partial response as usable for the listed
+targets and retry only the failed/missing target instead of assuming all warmups
+were discarded.
+
+**Errors:**
+
+- `400` — invalid TTL.
+- `403` — warmup feature flag is disabled.
+- `404` — project not found.
+- `409` — none of the effective warmup target runtimes support session fork.
+- `502` — runtime execution failed or did not return a seed session id.
+- `207` — partial success; at least one target warmup remains active while another target failed.
+
+**WebSocket event:** `project:warmup_updated` with `{ projectId, status }`.
+
+### Clear Project Warmup
+
+```
+DELETE /projects/:id/warmup
+```
+
+Clears active warmup rows for the project's current effective warmup target
+runtimes.
+
+**Response:** `200 OK`
+
+```json
+{ "success": true, "cleared": 1 }
+```
+
+**WebSocket event:** `project:warmup_updated` when at least one row is cleared.
+
 ### Get Project MCP Config
 
 ```
@@ -253,6 +472,94 @@ If `.mcp.json` does not exist (or cannot be parsed), returns:
 ```json
 { "mcpServers": {} }
 ```
+
+### Broadcast Project Update
+
+```
+POST /projects/:id/broadcast
+```
+
+Used by API/agent services to trigger project-scoped WebSocket broadcasts without polling.
+
+**Security contract:**
+
+- Intended for trusted internal callers (API/agent/mcp services).
+- If `INTERNAL_BROADCAST_TOKEN` is configured, callers must provide the same token via `Authorization: Bearer <token>` or `X-Internal-Broadcast-Token`.
+- If no token is configured, only `NODE_ENV=development` enables the fallback path, and it only accepts loopback caller headers (`127.0.0.1`, `::1`, `localhost`).
+- Unauthorized callers receive `401`.
+- Relation validation is enforced before broadcasting:
+  - `project:auto_queue_advanced` returns `400` when `taskId` does not belong to the target project.
+  - `project:runtime_limit_updated` returns `400` when `runtimeProfileId` is omitted.
+  - `project:runtime_limit_updated` returns `400` when `runtimeProfileId` does not belong to the target project and is not global.
+
+**Body:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `type` | string | yes | One of `project:auto_queue_mode_changed`, `project:auto_queue_advanced`, `project:runtime_limit_updated` |
+| `taskId` | string | no | Optional related task id for runtime-limit updates |
+| `runtimeProfileId` | string\|null | conditional | Required for `project:runtime_limit_updated`; runtime profile whose persisted limit snapshot changed |
+
+**Response:** `200 OK`
+
+```json
+{ "success": true }
+```
+
+---
+
+## Runtime Profiles
+
+Runtime profiles carry non-secret transport/model config plus the latest persisted runtime-limit snapshot used by API, agent, and UI surfaces.
+For local Codex runtimes (`runtimeId=codex` with `sdk`/`cli` transport), `/runtime-profiles` and `/runtime-profiles/effective/*` now read limit overlays from the SQLite Codex index (`codex_limit_heads`) maintained by the background API indexer. Request handlers do not perform direct `~/.codex/sessions` scans.
+
+### List Runtime Profiles
+
+```
+GET /runtime-profiles?projectId=<uuid>&includeGlobal=true&enabledOnly=false
+```
+
+**Response:** `200 OK` — array of runtime profile objects.
+
+Notable runtime profile fields in list/detail/effective responses:
+
+| Field                   | Type         | Description                                                                |
+| ----------------------- | ------------ | -------------------------------------------------------------------------- |
+| `runtimeLimitSnapshot`  | object\|null | Latest normalized provider/runtime limit state persisted for this profile  |
+| `runtimeLimitUpdatedAt` | string\|null | ISO timestamp when the profile snapshot was last written or cleared        |
+| `lastUsage`             | object\|null | Last recorded per-run usage totals for this profile (`input/output/total`) |
+| `lastUsageAt`           | string\|null | ISO timestamp of the latest recorded usage event for this profile          |
+
+### Effective Runtime Selection
+
+```
+GET /runtime-profiles/effective/task/:taskId
+GET /runtime-profiles/effective/chat/:projectId
+```
+
+Both responses include the resolved `profile` object (or `null`) plus source metadata. When a profile is present, its payload includes `runtimeLimitSnapshot` and `runtimeLimitUpdatedAt`.
+If no indexed Codex head is available for the resolved account/project scope, the response falls back to the persisted profile snapshot.
+
+### Runtime Limit Snapshot Shape
+
+The normalized `runtimeLimitSnapshot` object is shared across runtime-profile, task, and chat payloads:
+
+| Field               | Type         | Description                                                                |
+| ------------------- | ------------ | -------------------------------------------------------------------------- |
+| `source`            | string       | Limit source: `provider_api`, `sdk_event`, `api_headers`, or `turn_usage`  |
+| `status`            | string       | `ok`, `warning`, `blocked`, or `unknown`                                   |
+| `precision`         | string       | `exact` for hard quota data, `heuristic` for provider qualitative state    |
+| `checkedAt`         | string       | ISO timestamp when the snapshot was observed                               |
+| `providerId`        | string       | Provider namespace (for example `anthropic`, `openai`)                     |
+| `runtimeId`         | string\|null | Runtime adapter id                                                         |
+| `profileId`         | string\|null | Runtime profile id when known                                              |
+| `primaryScope`      | string\|null | Main quota window scope (`requests`, `tokens`, `time`, etc.)               |
+| `resetAt`           | string\|null | Provider reset timestamp when available                                    |
+| `retryAfterSeconds` | number\|null | Retry hint when only backoff seconds are known                             |
+| `warningThreshold`  | number\|null | Exact threshold percentage when the provider reports it                    |
+| `windows`           | array        | Per-window quota details (`remaining`, `percentRemaining`, `resetAt`, ...) |
+| `providerMeta`      | object\|null | Sanitized provider-specific qualitative metadata kept for diagnostics/UI   |
+
+`providerMeta` is client-visible and always normalized before leaving the server. It may include safe identifiers such as `limitId`, `providerLabel`, `quotaSource`, `accountLabel`, `accountFingerprint`, `planType`, `modelUsageSummary`, or `toolUsageSummary`, but raw provider responses, headers, bodies, traces, and token-like fields are stripped or redacted.
 
 ---
 
@@ -288,7 +595,8 @@ POST /tasks
 | `isFix` | boolean | no | `false` | Marks the task as fix-flow task (uses FIX plan conventions) |
 | `skipReview` | boolean | no | `false` | Skip the review stage — task moves directly from implementing to done |
 | `paused` | boolean | no | `false` | Pause agent processing — coordinator skips this task until resumed |
-| `useSubagents` | boolean | no | `true` | Run via custom subagents (`plan-coordinator`, `implement-coordinator`, sidecars). `false` uses `aif-*` skills directly |
+| `useSubagents` | boolean | no | `false` | Run via custom subagents (`plan-coordinator`, `implement-coordinator`, sidecars). `false` uses `aif-*` skills directly |
+| `runtimeProfileId` | string \| null | no | `null` | Task-specific runtime override. When absent, resolution falls back to project default, then app default, then environment fallback |
 | `roadmapAlias` | string | no | `null` | Roadmap alias for grouping (e.g., `v1.0`) |
 | `tags` | string[] | no | `[]` | Tags for filtering/categorization (max 50, each max 100 chars) |
 | `scheduledAt` | string \| null | no | `null` | ISO-8601 UTC timestamp. If set, the coordinator fires the task into planning at that time. Must be in the future; `null` clears it. Accepted on both create and update. |
@@ -315,10 +623,12 @@ GET /tasks/:id
 
 Notable task fields in the response:
 
-| Field                  | Type         | Description                                                                                                      |
-| ---------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `manualReviewRequired` | boolean      | `true` when auto-review stopped and explicit human review is required while the task remains in `done`           |
-| `autoReviewState`      | object\|null | Latest persisted blocking-findings snapshot used by the auto-review loop (`strategy`, `iteration`, `findings[]`) |
+| Field                   | Type         | Description                                                                                                      |
+| ----------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `manualReviewRequired`  | boolean      | `true` when auto-review stopped and explicit human review is required while the task remains in `done`           |
+| `autoReviewState`       | object\|null | Latest persisted blocking-findings snapshot used by the auto-review loop (`strategy`, `iteration`, `findings[]`) |
+| `runtimeLimitSnapshot`  | object\|null | Persisted runtime-limit snapshot copied onto the task when quota gating or quota failure blocks execution        |
+| `runtimeLimitUpdatedAt` | string\|null | ISO timestamp for the last task-level runtime-limit snapshot write                                               |
 
 ### Download Task Attachment
 
@@ -363,6 +673,7 @@ PUT /tasks/:id
 | `priority` | integer | Priority (0-5) |
 | `autoMode` | boolean | Auto-advance mode (includes automatic post-review rework loop when enabled) |
 | `paused` | boolean | Pause/resume agent processing for this task |
+| `runtimeProfileId` | string\|null | Task-specific runtime override |
 | `isFix` | boolean | Marks task as fix-flow |
 | `plan` | string\|null | Generated plan (markdown) |
 | `implementationLog` | string\|null | Implementation output |
@@ -455,10 +766,16 @@ POST /tasks/:id/broadcast
 
 Used by the agent process to trigger WebSocket broadcasts after updating a task.
 
+**Security contract:**
+
+- Intended for trusted internal callers (agent/API services only).
+- Uses the same internal auth rules as `POST /projects/:id/broadcast`.
+- Unauthorized callers receive `401`.
+
 **Body:**
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `type` | string | `task:updated` | Event type: `task:updated` or `task:moved` |
+| `type` | string | `task:updated` | Event type: `task:updated`, `task:moved`, `task:activity`, or `task:scheduled_fired` |
 
 **Response:** `200 OK`
 
@@ -507,9 +824,163 @@ POST /tasks/:id/comments
 
 ---
 
+## Runtime Profiles
+
+### List Runtime Profiles
+
+```
+GET /runtime-profiles
+```
+
+**Query params:**
+
+| Param           | Type                           | Required | Description                                                                                                             |
+| --------------- | ------------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `projectId`     | string                         | no       | Project id for project-scoped queries and mixed listings                                                                |
+| `includeGlobal` | boolean                        | no       | Include global profiles alongside project profiles                                                                      |
+| `enabledOnly`   | boolean                        | no       | Return only enabled profiles                                                                                            |
+| `scope`         | `global`\|`project`\|`visible` | no       | `global`: only global profiles, `project`: only same-project profiles, `visible`: project profiles plus visible globals |
+
+`scope=project` requires `projectId`. `scope=global` returns only reusable profiles (`projectId = null`).
+`scope=visible` is the default when omitted.
+For local Codex profiles, this endpoint overlays the response from indexed Codex limit heads in SQLite instead of scanning `~/.codex/sessions` during request handling.
+
+### Effective Runtime Resolution
+
+```
+GET /runtime-profiles/effective/task/:taskId
+GET /runtime-profiles/effective/chat/:projectId
+```
+
+These endpoints return the effective runtime profile plus the resolution source. The runtime chain is:
+
+1. task override
+2. project default
+3. app default
+4. environment fallback
+
+Planning and review follow the same pattern but use their dedicated defaults before inheriting from the task default at the same scope.
+
+---
+
+## Codex OAuth Login (Docker)
+
+Wraps `codex login --device-auth` running inside the agent container so the
+host browser can complete the device-code flow. All `/auth/codex/login/*`
+mutating endpoints are gated behind `AIF_ENABLE_CODEX_LOGIN_PROXY=true`. When
+the flag is `false` only `/auth/codex/capabilities` is mounted; the others
+return `404`. See [Providers](providers.md#codex-oauth-login-in-docker-broker)
+for the full design.
+
+### Capabilities
+
+```
+GET /auth/codex/capabilities
+```
+
+**Response:** `200 OK`
+
+```json
+{ "loginProxyEnabled": true }
+```
+
+### Start Login
+
+```
+POST /auth/codex/login/start
+```
+
+Spawns `codex login --device-auth` in the agent container and parses the
+verification URL plus one-time code.
+
+**Response:** `200 OK`
+
+```json
+{
+  "sessionId": "9f3c1a8e-...",
+  "verificationUrl": "https://auth.openai.com/codex/device",
+  "userCode": "ABCD-12345",
+  "startedAt": "2026-04-27T16:30:00.000Z"
+}
+```
+
+`409 Conflict` when a session is already active — the body still carries
+`{sessionId, verificationUrl, userCode}` so the client can adopt it.
+`500` on spawn failure or device-auth parse timeout.
+`502` when the API cannot reach the broker over the docker network.
+
+### Status
+
+```
+GET /auth/codex/login/status
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "active": true,
+  "sessionId": "9f3c1a8e-...",
+  "verificationUrl": "https://auth.openai.com/codex/device",
+  "userCode": "ABCD-12345",
+  "startedAt": "2026-04-27T16:30:00.000Z"
+}
+```
+
+When no session is active the response carries the **terminal result of the
+last run** so the client can distinguish success from failure:
+
+```json
+{
+  "active": false,
+  "lastResult": {
+    "ok": true,
+    "sessionId": "9f3c1a8e-...",
+    "reason": "success",
+    "exitCode": 0,
+    "signal": null,
+    "finishedAt": "2026-04-27T16:32:14.000Z"
+  }
+}
+```
+
+`reason` is one of `success`, `exit_nonzero`, `signal`, `timeout`,
+`parse_timeout`, `cancel`, `spawn_failed`. The UI **must** gate the success
+transition on `lastResult.ok === true`. If no session has ever run the field
+is omitted.
+
+| Reason          | Meaning                                                                            |
+| --------------- | ---------------------------------------------------------------------------------- |
+| `success`       | Codex CLI exited with code `0` and no signal — `~/.codex/auth.json` was written.   |
+| `exit_nonzero`  | Codex CLI exited with a non-zero status code (network/TLS failure, server reject). |
+| `signal`        | Codex CLI was killed by a signal (e.g. `SIGKILL`) before completing login.         |
+| `timeout`       | The 5-minute wizard session expired before the user completed the browser flow.    |
+| `parse_timeout` | The CLI did not print a verification URL + code within 15 seconds of spawn.        |
+| `cancel`        | The user pressed Cancel; broker SIGTERMed the child.                               |
+| `spawn_failed`  | The codex binary could not be spawned (missing/unexecutable, ENOENT/EACCES).       |
+
+### Cancel
+
+```
+POST /auth/codex/login/cancel
+```
+
+`SIGTERM`s the active child process. Records a terminal result with
+`reason: "cancel"`, `ok: false`.
+
+**Response:** `200 OK`
+
+```json
+{ "ok": true, "cancelled": true, "sessionId": "9f3c1a8e-..." }
+```
+
+`{ ok: true, cancelled: false }` when there was no active session.
+
+---
+
 ## AI Chat
 
-Interactive AI chat powered by the runtime adapter system. Messages are sent via REST, responses stream back through WebSocket as tokens. The runtime used depends on the project's active runtime profile.
+Interactive AI chat powered by the runtime adapter system. Messages are sent via REST, responses stream back through WebSocket as tokens. The runtime used depends on the effective chat runtime for the project: project chat default, then app chat default, then environment fallback.
 
 ### Send Message
 
@@ -525,23 +996,27 @@ POST /chat
 | `clientId` | string | yes | | WebSocket client ID for streaming tokens back |
 | `conversationId` | string | no | auto-generated | Pass the previous `conversationId` to continue a multi-turn conversation |
 | `explore` | boolean | no | `false` | When `true`, the message is prefixed with `/aif-explore` for codebase exploration mode |
-| `taskId` | string | no | | Task UUID — injects the task's full context (status, plan, implementation log, review comments, activity log) into the chat session for task-aware discussion |
+| `taskId` | string | no | | Task UUID — injects the task's full context (status, plan, implementation log, review comments, and redacted activity log) into the chat session for task-aware discussion |
 
 **Response:** `200 OK`
 
 ```json
 {
-  "conversationId": "uuid"
+  "conversationId": "uuid",
+  "sessionId": "uuid-or-null",
+  "assistantMessage": null,
+  "attachments": [],
+  "runtimeLimitSnapshot": null
 }
 ```
 
 **Errors:**
 
 - `404` — Project not found
-- `429` — Claude usage limit reached (`code: "CHAT_USAGE_LIMIT"`)
+- `429` — Runtime usage limit reached (`code: "CHAT_USAGE_LIMIT"`, response may include `runtimeLimitSnapshot`)
 - `500` — Chat request failed (`code: "CHAT_REQUEST_FAILED"`)
 
-On error, a `chat:error` event is sent via WebSocket before the HTTP response.
+On error, a `chat:error` event is sent via WebSocket before the HTTP response. Both HTTP and WebSocket chat payloads normalize `runtimeLimitSnapshot` before emission, so client-visible snapshots follow the same sanitized contract as runtime-profile and task payloads.
 
 **Timeout:** Requests may take up to 120 seconds due to agent processing.
 
@@ -549,17 +1024,31 @@ On error, a `chat:error` event is sent via WebSocket before the HTTP response.
 
 Chat responses stream via WebSocket events to the `clientId` specified in the request:
 
-| Event        | Payload                             | Description                                       |
-| ------------ | ----------------------------------- | ------------------------------------------------- |
-| `chat:token` | `{ conversationId, token }`         | Incremental text token from the agent             |
-| `chat:done`  | `{ conversationId }`                | Stream completed (sent on both success and error) |
-| `chat:error` | `{ conversationId, message, code }` | Error occurred during streaming                   |
+| Event        | Payload                                                                                            | Description                           |
+| ------------ | -------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| `chat:token` | `{ conversationId, token }`                                                                        | Incremental text token from the agent |
+| `chat:done`  | `{ conversationId, usage?, projectId?, taskId?, runtimeProfileId?, runtimeLimitSnapshot? }`        | Stream completed                      |
+| `chat:error` | `{ conversationId, message, code, projectId?, taskId?, runtimeProfileId?, runtimeLimitSnapshot? }` | Error occurred during streaming       |
 
 ### Multi-turn Conversations
 
 To continue a conversation, pass the `conversationId` returned from the first message in subsequent requests. The server tracks runtime session IDs internally and uses `resume` to maintain context (for runtimes that support it).
 
 Calling `clearMessages` on the client (or omitting `conversationId`) starts a fresh conversation.
+
+### Chat Sessions
+
+```
+GET /chat/sessions?projectId=<uuid>
+POST /chat/sessions
+PUT /chat/sessions/:id
+DELETE /chat/sessions/:id
+```
+
+Chat sessions persist the runtime profile chosen when the session starts. This keeps older conversations tied to the runtime they were created with even if the project's current default changes later.
+For local Codex runtimes, session discovery uses the indexed `codex_sessions` read-model. Session detail/message reads resolve `sessionId -> filePath` from the same index before compatibility fallback to runtime-adapter lookups.
+
+`POST` and `PUT` accept `runtimeProfileId` as an optional field. The value must be either a global profile or one owned by the same project.
 
 ### Permissions
 
@@ -628,27 +1117,35 @@ All events are JSON with this structure:
 }
 ```
 
-| Event                             | Payload                             | Triggered By                                                                         |
-| --------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------ |
-| `project:created`                 | Full project object                 | `POST /projects`                                                                     |
-| `task:created`                    | Full task object                    | `POST /tasks`, `POST /projects/:id/roadmap/import`                                   |
-| `task:updated`                    | Full task object                    | `PUT /tasks/:id`, `PATCH /tasks/:id/position`, `POST /tasks/:id/events` (`fast_fix`) |
-| `task:moved`                      | Full task object                    | `POST /tasks/:id/events`                                                             |
-| `task:deleted`                    | `{ id: string }`                    | `DELETE /tasks/:id`                                                                  |
-| `sync:task_created`               | Full task object                    | MCP `handoff_create_task`                                                            |
-| `sync:task_updated`               | Full task object                    | MCP `handoff_update_task`, `handoff_push_plan`                                       |
-| `sync:status_changed`             | Full task object                    | MCP `handoff_sync_status`                                                            |
-| `sync:plan_pushed`                | Full task object                    | MCP `handoff_push_plan`                                                              |
-| `chat:token`                      | `{ conversationId, token }`         | `POST /chat` — streaming response tokens                                             |
-| `chat:done`                       | `{ conversationId }`                | `POST /chat` — stream completed                                                      |
-| `chat:error`                      | `{ conversationId, message, code }` | `POST /chat` — error during streaming                                                |
-| `task:scheduled_fired`            | Full task object                    | Coordinator fires a backlog task whose `scheduledAt` is due                          |
-| `project:auto_queue_mode_changed` | Full project object                 | `PATCH /projects/:id/auto-queue-mode`                                                |
-| `project:auto_queue_advanced`     | `{ id: string }` (task id)          | Coordinator auto-advances the next backlog task in an auto-queue project             |
+| Event                             | Payload                                                                                            | Triggered By                                                                         |
+| --------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `project:created`                 | Full project object                                                                                | `POST /projects`                                                                     |
+| `task:created`                    | Full task object                                                                                   | `POST /tasks`, `POST /projects/:id/roadmap/import`                                   |
+| `task:updated`                    | Full task object                                                                                   | `PUT /tasks/:id`, `PATCH /tasks/:id/position`, `POST /tasks/:id/events` (`fast_fix`) |
+| `task:moved`                      | Full task object                                                                                   | `POST /tasks/:id/events`                                                             |
+| `task:deleted`                    | `{ id: string }`                                                                                   | `DELETE /tasks/:id`                                                                  |
+| `sync:task_created`               | Full task object                                                                                   | MCP `handoff_create_task`                                                            |
+| `sync:task_updated`               | Full task object                                                                                   | MCP `handoff_update_task`, `handoff_push_plan`                                       |
+| `sync:status_changed`             | Full task object                                                                                   | MCP `handoff_sync_status`                                                            |
+| `sync:plan_pushed`                | Full task object                                                                                   | MCP `handoff_push_plan`                                                              |
+| `chat:token`                      | `{ conversationId, token }`                                                                        | `POST /chat` — streaming response tokens                                             |
+| `chat:done`                       | `{ conversationId, usage?, projectId?, taskId?, runtimeProfileId?, runtimeLimitSnapshot? }`        | `POST /chat` — stream completed                                                      |
+| `chat:error`                      | `{ conversationId, message, code, projectId?, taskId?, runtimeProfileId?, runtimeLimitSnapshot? }` | `POST /chat` — error during streaming                                                |
+| `task:scheduled_fired`            | Full task object                                                                                   | Coordinator fires a backlog task whose `scheduledAt` is due                          |
+| `project:auto_queue_mode_changed` | Full project object                                                                                | `PATCH /projects/:id/auto-queue-mode`                                                |
+| `project:auto_queue_advanced`     | `{ id: string }` (task id)                                                                         | Coordinator auto-advances the next backlog task in an auto-queue project             |
+| `project:runtime_limit_updated`   | `{ projectId, runtimeProfileId, taskId? }`                                                         | Persisted runtime-profile limit state or last usage changed                          |
+| `project:warmup_updated`          | `{ projectId, status }`                                                                            | Warmup create/delete/failure changed project warmup state                            |
 
 ### Connection
 
-The WebSocket endpoint is a simple broadcast channel — no authentication, no subscription topics. All connected clients receive all events.
+The WebSocket endpoint is a broadcast channel with no topic subscriptions; connected clients receive all events. Keep this endpoint behind trusted network boundaries and do not include raw provider diagnostics or secrets in event payloads.
+
+Runtime-limit invalidation is project-scoped:
+
+- `project:runtime_limit_updated` payload is `{ projectId, runtimeProfileId, taskId? }`, and `runtimeProfileId` is required at emission time.
+- API/agent callers emit this via `POST /projects/:id/broadcast` after runtime snapshot/usage updates.
+- `project:warmup_updated` payload is `{ projectId, status }`, where `status` is `ready`, `failed`, `partial`, `cleared`, or `expired`.
 
 ## MCP Sync Integration
 

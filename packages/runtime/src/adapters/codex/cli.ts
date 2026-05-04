@@ -1,5 +1,6 @@
 import { spawn, execFileSync } from "node:child_process";
 import type { RuntimeEvent, RuntimeRunInput, RuntimeRunResult, RuntimeUsage } from "../../types.js";
+import { buildRuntimeLimitEvent } from "../../limitEvents.js";
 import {
   makeProcessRunTimeoutError,
   makeProcessStartTimeoutError,
@@ -8,6 +9,8 @@ import {
   withProcessTimeouts,
 } from "../../timeouts.js";
 import { classifyCodexRuntimeError } from "./errors.js";
+import { getCodexSessionLimitSnapshot } from "./sessions.js";
+import { assertSafeWindowsShellExecutablePath } from "../../shellSafety.js";
 import {
   normalizeCodexApprovalPolicy,
   normalizeCodexSandboxMode,
@@ -24,6 +27,8 @@ export interface CodexCliLogger {
   warn?(context: Record<string, unknown>, message: string): void;
   error?(context: Record<string, unknown>, message: string): void;
 }
+
+const CODEX_SESSION_LIMIT_POLL_INTERVAL_MS = 1_000;
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -127,19 +132,44 @@ function readStringArray(value: unknown): string[] | null {
   return parsed.length > 0 ? parsed : null;
 }
 
-function normalizeCliArgs(input: RuntimeRunInput, logger?: CodexCliLogger): string[] {
+interface NormalizedCliArgs {
+  args: string[];
+  /**
+   * True when the configured custom `codexCliArgs` embedded the prompt via a
+   * `{prompt}` placeholder anywhere in any arg (including composite shapes
+   * like `--payload=prefix {prompt} suffix`). Tracked pre-substitution — the
+   * literal `{prompt}` token is gone from `args` after `normalizeCliArgs()`
+   * returns, so the flag is the only reliable signal for the stdin suppressor.
+   */
+  usesPromptPlaceholder: boolean;
+}
+
+function normalizeCliArgs(
+  input: RuntimeRunInput,
+  effectivePrompt: string,
+  logger?: CodexCliLogger,
+): NormalizedCliArgs {
   const options = asRecord(input.options);
   const configured = readStringArray(options.codexCliArgs);
 
-  // Custom args — apply template substitutions
+  // Custom args — apply template substitutions.
+  //
+  // `effectivePrompt` already carries `execution.systemPromptAppend`
+  // prepended by `composePrompt()` so the registry's language directive
+  // (and any other cross-cutting append) reaches the model via the
+  // `{prompt}` placeholder too — not only through the default stdin path.
   if (configured) {
-    return configured.map((arg) => {
-      if (arg.includes("{prompt}")) return arg.replaceAll("{prompt}", input.prompt);
-      if (arg.includes("{model}")) return arg.replaceAll("{model}", input.model ?? "");
-      if (arg.includes("{session_id}"))
-        return arg.replaceAll("{session_id}", input.sessionId ?? "");
-      return arg;
+    let usesPromptPlaceholder = false;
+    const args = configured.map((arg) => {
+      if (arg.includes("{prompt}")) {
+        usesPromptPlaceholder = true;
+      }
+      return arg
+        .replaceAll("{prompt}", effectivePrompt)
+        .replaceAll("{model}", input.model ?? "")
+        .replaceAll("{session_id}", input.sessionId ?? "");
     });
+    return { args, usesPromptPlaceholder };
   }
 
   // Default args — resume session or fresh exec
@@ -176,7 +206,7 @@ function normalizeCliArgs(input: RuntimeRunInput, logger?: CodexCliLogger): stri
   args.push("-c", `approval_policy="${approvalPolicy}"`);
   args.push("-c", `sandbox_mode="${sandboxMode}"`);
 
-  return args;
+  return { args, usesPromptPlaceholder: false };
 }
 
 const ALLOWED_ENV_PREFIXES = [
@@ -266,6 +296,9 @@ function resolveCliPath(input: RuntimeRunInput): string {
  */
 export function probeCodexCli(cliPath: string): { ok: boolean; version?: string; error?: string } {
   try {
+    if (IS_WINDOWS) {
+      assertSafeWindowsShellExecutablePath(cliPath, "Codex CLI path");
+    }
     const out = execFileSync(cliPath, ["--version"], {
       timeout: 5_000,
       shell: IS_WINDOWS,
@@ -301,6 +334,7 @@ function spawnCliWindows(
   cwd: string | undefined,
   env: Record<string, string>,
 ) {
+  assertSafeWindowsShellExecutablePath(cliPath, "Codex CLI path");
   const cmd = process.env.ComSpec ?? "cmd.exe";
   const cmdLine = [cliPath, ...args.map(quoteIfNeeded)].join(" ");
   return spawn(cmd, ["/d", "/c", cmdLine], {
@@ -621,13 +655,139 @@ function finalizeCodexResult(
   };
 }
 
-function shouldWritePromptToStdin(args: string[], prompt: string): boolean {
-  if (prompt && args.includes(prompt)) {
-    return false;
-  }
-  return !args.some(
-    (arg) => arg.includes("{prompt}") || arg === "--prompt" || arg.startsWith("--prompt="),
+function hasRuntimeLimitSnapshotSignature(
+  events: RuntimeEvent[] | null | undefined,
+  signature: string,
+): boolean {
+  return (
+    events?.some((event) => {
+      if (event.type !== "runtime:limit") {
+        return false;
+      }
+      return JSON.stringify(event.data?.snapshot ?? null) === signature;
+    }) ?? false
   );
+}
+
+async function appendCodexSessionLimitEvent(input: RuntimeRunInput, result: RuntimeRunResult) {
+  const sessionId = result.sessionId ?? null;
+  if (!sessionId) {
+    return result;
+  }
+
+  const snapshot = await getCodexSessionLimitSnapshot({
+    sessionId,
+    runtimeId: input.runtimeId,
+    providerId: input.providerId ?? "openai",
+    profileId: input.profileId ?? null,
+  });
+  if (!snapshot) {
+    return result;
+  }
+
+  const signature = JSON.stringify(snapshot);
+  if (hasRuntimeLimitSnapshotSignature(result.events, signature)) {
+    return result;
+  }
+
+  const limitEvent = buildRuntimeLimitEvent(snapshot, "token_count");
+  const nextEvents = [...(result.events ?? []), limitEvent];
+  input.execution?.onEvent?.(limitEvent);
+
+  return {
+    ...result,
+    events: nextEvents,
+  };
+}
+
+interface CodexSessionLimitObserverState {
+  lastCheckedAtMs: number;
+  lastSignature: string | null;
+}
+
+async function maybeEmitCodexSessionLimitEvent(input: {
+  runtimeInput: RuntimeRunInput;
+  sessionId: string | null;
+  state: CodexCliStreamState;
+  observerState: CodexSessionLimitObserverState;
+  logger?: CodexCliLogger;
+  force?: boolean;
+}): Promise<void> {
+  const sessionId = input.sessionId;
+  if (!sessionId) {
+    return;
+  }
+
+  const nowMs = Date.now();
+  if (
+    input.force !== true &&
+    input.observerState.lastCheckedAtMs > 0 &&
+    nowMs - input.observerState.lastCheckedAtMs < CODEX_SESSION_LIMIT_POLL_INTERVAL_MS
+  ) {
+    return;
+  }
+  input.observerState.lastCheckedAtMs = nowMs;
+
+  const snapshot = await getCodexSessionLimitSnapshot({
+    sessionId,
+    runtimeId: input.runtimeInput.runtimeId,
+    providerId: input.runtimeInput.providerId ?? "openai",
+    profileId: input.runtimeInput.profileId ?? null,
+  });
+  if (!snapshot) {
+    return;
+  }
+
+  const signature = JSON.stringify(snapshot);
+  if (input.observerState.lastSignature === signature) {
+    return;
+  }
+  input.observerState.lastSignature = signature;
+
+  const limitEvent = buildRuntimeLimitEvent(snapshot, "token_count");
+  emitCodexEvent(input.state, input.runtimeInput.execution, limitEvent);
+  input.logger?.debug?.(
+    {
+      runtimeId: input.runtimeInput.runtimeId,
+      transport: "cli",
+      sessionId,
+      status: snapshot.status,
+      checkedAt: snapshot.checkedAt,
+    },
+    "Observed Codex session token_count rate limits during CLI run",
+  );
+}
+
+/**
+ * Compose the prompt that actually reaches the model: `systemPromptAppend`
+ * (registry-injected language directive + any other cross-cutting appends)
+ * prepended to `input.prompt`, separated by a blank line.
+ *
+ * The Codex CLI has no dedicated system-prompt slot, so this is the only way
+ * to deliver `execution.systemPromptAppend` to the model. Computing it once
+ * at the top of the run and threading it through both template substitution
+ * and stdin write keeps delivery guarantees uniform across the default path
+ * AND custom `codexCliArgs` escape hatches that use `{prompt}`.
+ */
+function composePrompt(input: RuntimeRunInput): string {
+  const append = input.execution?.systemPromptAppend?.trim();
+  return append ? `${append}\n\n${input.prompt}` : input.prompt;
+}
+
+function shouldWritePromptToStdin(args: string[], usesPromptPlaceholder: boolean): boolean {
+  // Any custom arg that embedded `{prompt}` already carries the composed
+  // prompt after substitution — including composite shapes like
+  // `--payload=prefix {prompt} suffix` that the `--prompt`/`--prompt=*` check
+  // below would not catch. `usesPromptPlaceholder` captures that signal
+  // pre-substitution, so we can suppress stdin uniformly.
+  //
+  // A prior `args.includes(prompt)` branch was intentionally removed: the
+  // default-path `args` always carry generic tokens like `exec`, `--json`, or
+  // the model id, so a user prompt that happens to equal one of those would
+  // be false-positive-matched and never delivered. The placeholder flag plus
+  // the explicit `--prompt` check cover every legitimate embed path already.
+  if (usesPromptPlaceholder) return false;
+  return !args.some((arg) => arg === "--prompt" || arg.startsWith("--prompt="));
 }
 
 function spawnCodexProcess(
@@ -647,6 +807,8 @@ function runCodexCliAttempt(
   cliPath: string,
   args: string[],
   env: Record<string, string>,
+  composedPrompt: string,
+  usesPromptPlaceholder: boolean,
   logger?: CodexCliLogger,
 ): Promise<{ result: RuntimeRunResult; startTimedOut: boolean }> {
   const execution = input.execution;
@@ -659,8 +821,38 @@ function runCodexCliAttempt(
   });
 
   const state = createCodexStreamState(input.sessionId ?? null);
+  const limitObserverState: CodexSessionLimitObserverState = {
+    lastCheckedAtMs: 0,
+    lastSignature: null,
+  };
   let stdoutBuffer = "";
   let stderr = "";
+  let limitPollChain = Promise.resolve();
+
+  const scheduleLimitPoll = (force = false): void => {
+    limitPollChain = limitPollChain
+      .then(() =>
+        maybeEmitCodexSessionLimitEvent({
+          runtimeInput: input,
+          sessionId: state.sessionId,
+          state,
+          observerState: limitObserverState,
+          logger,
+          force,
+        }),
+      )
+      .catch((err) => {
+        logger?.warn?.(
+          {
+            runtimeId: input.runtimeId,
+            transport: "cli",
+            sessionId: state.sessionId,
+            err,
+          },
+          "Failed to inspect Codex session token_count rate limits during CLI run",
+        );
+      });
+  };
 
   const flushCompleteLines = (): void => {
     let newlineIdx = stdoutBuffer.indexOf("\n");
@@ -668,6 +860,7 @@ function runCodexCliAttempt(
       const line = stdoutBuffer.slice(0, newlineIdx);
       stdoutBuffer = stdoutBuffer.slice(newlineIdx + 1);
       processCodexJsonLine(line, state, execution);
+      scheduleLimitPoll();
       newlineIdx = stdoutBuffer.indexOf("\n");
     }
   };
@@ -704,8 +897,13 @@ function runCodexCliAttempt(
   child.stdin!.on("error", () => {
     // Ignore broken-pipe errors — the child may exit before stdin is fully written
   });
-  if (shouldWritePromptToStdin(args, input.prompt)) {
-    child.stdin!.write(input.prompt);
+  // `composedPrompt` already includes `execution.systemPromptAppend`
+  // prepended to the user prompt (see `composePrompt()`). When custom
+  // `codexCliArgs` embed the prompt via `{prompt}` or `--prompt`, the same
+  // value was substituted into `args`, so `shouldWritePromptToStdin()` skips
+  // stdin here to avoid sending the prompt twice.
+  if (shouldWritePromptToStdin(args, usesPromptPlaceholder)) {
+    child.stdin!.write(composedPrompt);
   }
   child.stdin!.end();
 
@@ -722,11 +920,15 @@ function runCodexCliAttempt(
       if (stdoutBuffer.length > 0) {
         try {
           processCodexJsonLine(stdoutBuffer, state, execution);
+          scheduleLimitPoll();
         } catch {
           /* ignore tail processing errors */
         }
         stdoutBuffer = "";
       }
+
+      scheduleLimitPoll(true);
+      await limitPollChain;
 
       const startTimedOut = await timeouts.startTimedOut;
 
@@ -769,7 +971,12 @@ export async function runCodexCli(
   logger?: CodexCliLogger,
 ): Promise<RuntimeRunResult> {
   const cliPath = resolveCliPath(input);
-  const args = normalizeCliArgs(input, logger);
+  // Compose once so the same prompt (systemPromptAppend + user prompt) is
+  // used for both template substitution in `codexCliArgs` and the stdin
+  // fallback — otherwise a custom `--prompt={prompt}` would silently drop
+  // the language directive the registry attached via `systemPromptAppend`.
+  const composedPrompt = composePrompt(input);
+  const { args, usesPromptPlaceholder } = normalizeCliArgs(input, composedPrompt, logger);
   const options = asRecord(input.options);
   const apiKeyEnvVar =
     typeof options.apiKeyEnvVar === "string" ? options.apiKeyEnvVar : "OPENAI_API_KEY";
@@ -784,7 +991,7 @@ export async function runCodexCli(
       blockedEnvCount: curatedEnv.blockedCount,
       droppedDisallowedPrefixCount: curatedEnv.droppedDisallowedPrefixKeys.length,
     },
-    "DEBUG [runtime:codex] Built Codex CLI environment from curated allowlist",
+    "[runtime:codex] Built Codex CLI environment from curated allowlist",
   );
   if (curatedEnv.droppedDisallowedPrefixKeys.length > 0) {
     logger?.warn?.(
@@ -809,7 +1016,15 @@ export async function runCodexCli(
     "Starting Codex CLI run",
   );
 
-  const { result, startTimedOut } = await runCodexCliAttempt(input, cliPath, args, env, logger);
+  const { result, startTimedOut } = await runCodexCliAttempt(
+    input,
+    cliPath,
+    args,
+    env,
+    composedPrompt,
+    usesPromptPlaceholder,
+    logger,
+  );
 
   if (startTimedOut) {
     const retryDelayMs = resolveRetryDelay(input.execution ?? {});
@@ -819,12 +1034,20 @@ export async function runCodexCli(
     );
     await sleepMs(retryDelayMs);
 
-    const retry = await runCodexCliAttempt(input, cliPath, args, env, logger);
+    const retry = await runCodexCliAttempt(
+      input,
+      cliPath,
+      args,
+      env,
+      composedPrompt,
+      usesPromptPlaceholder,
+      logger,
+    );
     if (retry.startTimedOut) {
       throw makeProcessStartTimeoutError(input.execution?.startTimeoutMs ?? 0);
     }
-    return retry.result;
+    return appendCodexSessionLimitEvent(input, retry.result);
   }
 
-  return result;
+  return appendCodexSessionLimitEvent(input, result);
 }

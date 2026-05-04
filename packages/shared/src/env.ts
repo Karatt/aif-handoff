@@ -61,6 +61,7 @@ const envSchema = z.object({
       return value;
     }, z.boolean())
     .default(true),
+  INTERNAL_BROADCAST_TOKEN: z.string().optional(),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("debug"),
   ACTIVITY_LOG_MODE: z
     .preprocess((value) => {
@@ -112,7 +113,59 @@ const envSchema = z.object({
       }
       return value;
     }, z.boolean())
-    .default(true),
+    .default(false),
+  AIF_USAGE_LIMITS_ENABLED: z
+    .preprocess((value) => {
+      if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (BOOLEAN_TRUE_VALUES.has(normalized)) return true;
+        if (BOOLEAN_FALSE_VALUES.has(normalized)) return false;
+      }
+      return value;
+    }, z.boolean())
+    .default(false),
+  AIF_WARMUP_ENABLED: z
+    .preprocess((value) => {
+      if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (BOOLEAN_TRUE_VALUES.has(normalized)) return true;
+        if (BOOLEAN_FALSE_VALUES.has(normalized)) return false;
+      }
+      return value;
+    }, z.boolean())
+    .default(false),
+  AIF_TASK_WORKTREES_ENABLED: z
+    .preprocess((value) => {
+      if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (BOOLEAN_TRUE_VALUES.has(normalized)) return true;
+        if (BOOLEAN_FALSE_VALUES.has(normalized)) return false;
+      }
+      return value;
+    }, z.boolean())
+    .default(false),
+  AIF_RUNTIME_SESSION_FORK_ENABLED: z
+    .preprocess((value) => {
+      if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (BOOLEAN_TRUE_VALUES.has(normalized)) return true;
+        if (BOOLEAN_FALSE_VALUES.has(normalized)) return false;
+      }
+      return value;
+    }, z.boolean())
+    .default(false),
+  AIF_ENABLE_CODEX_LOGIN_PROXY: z
+    .preprocess((value) => {
+      if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (BOOLEAN_TRUE_VALUES.has(normalized)) return true;
+        if (BOOLEAN_FALSE_VALUES.has(normalized)) return false;
+      }
+      return value;
+    }, z.boolean())
+    .default(false),
+  AIF_CODEX_LOGIN_BROKER_PORT: z.coerce.number().default(3010),
+  AGENT_INTERNAL_URL: z.string().default("http://agent:3010"),
   TELEGRAM_BOT_API_URL: z.string().optional(),
   TELEGRAM_BOT_TOKEN: z.string().optional(),
   TELEGRAM_USER_ID: z.string().optional(),
@@ -195,4 +248,13 @@ export function getEnv(): Env {
 /** Validate env without caching — useful for testing */
 export function validateEnv(env: Record<string, string | undefined> = process.env): Env {
   return envSchema.parse(env);
+}
+
+/**
+ * Drop the cached env so the next `getEnv()` re-parses `process.env`. Intended
+ * for tests that toggle feature flags at runtime — never call in production
+ * code paths, which assume env is a stable compile-time constant.
+ */
+export function resetEnvCache(): void {
+  _env = null;
 }

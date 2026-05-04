@@ -1,10 +1,33 @@
-import { and, asc, count, desc, eq, gt, inArray, isNotNull, isNull, like, lte, min, or, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  gt,
+  inArray,
+  isNotNull,
+  isNull,
+  like,
+  lt,
+  lte,
+  max,
+  min,
+  ne,
+  or,
+  sql,
+} from "drizzle-orm";
 import {
   AUTO_REVIEW_FINDING_SOURCES,
   AUTO_REVIEW_STRATEGIES,
+  buildRuntimeLimitSignature,
+  appSettings,
   generatePlanPath,
+  getEnv,
   getProjectConfig,
   logger as createLogger,
+  normalizeRuntimeLimitSnapshot,
+  redactProviderText,
   parseAttachments,
   parseTaskTokenUsage,
   persistTaskPlan,
@@ -15,12 +38,28 @@ import {
   chatSessions,
   chatMessages,
   usageEvents,
+  runtimeWarmupSessions,
+  codexSessions,
+  codexSessionFiles,
+  codexLimitHeads,
+  codexLimitHistory,
+  codexIndexCursors,
+  type AppSettings,
   type CreateRuntimeProfileInput,
   type EffectiveRuntimeProfileSelection,
   type RuntimeProfile,
+  type RuntimeProfileUsage,
+  type RuntimeLimitSnapshot,
+  type RuntimeLimitWindow,
+  type RuntimeLimitFutureHint,
+  type UpdateAppSettingsInput,
   type UpdateRuntimeProfileInput,
+  type RuntimeWarmupSessionStatus,
   type Task,
   type TaskStatus,
+  resolveRuntimeLimitFutureHint,
+  sanitizeRuntimeLimitSnapshotForExposure,
+  selectViolatedWindowForExactThreshold,
   type AutoReviewState,
   type ChatSession,
   type ChatSessionMessage,
@@ -33,14 +72,42 @@ import { getDb } from "@aif/shared/server";
 const log = createLogger("data");
 const AUTO_REVIEW_STRATEGY_SET = new Set<string>(AUTO_REVIEW_STRATEGIES);
 const AUTO_REVIEW_FINDING_SOURCE_SET = new Set<string>(AUTO_REVIEW_FINDING_SOURCES);
+const APP_SETTINGS_ID = 1;
 
 export type TaskRow = typeof tasks.$inferSelect;
 export type CommentRow = typeof taskComments.$inferSelect;
 export type ProjectRow = typeof projects.$inferSelect;
+export type AppSettingsRow = typeof appSettings.$inferSelect;
 export type RuntimeProfileRow = typeof runtimeProfiles.$inferSelect;
-export type HydratedTaskRow = TaskRow & { autoReviewState?: AutoReviewState | null };
+export type RuntimeWarmupSessionRow = typeof runtimeWarmupSessions.$inferSelect;
+export type CodexSessionIndexRow = typeof codexSessions.$inferSelect;
+export type CodexSessionFileIndexRow = typeof codexSessionFiles.$inferSelect;
+export type CodexLimitHeadIndexRow = typeof codexLimitHeads.$inferSelect;
+export type CodexLimitHistoryIndexRow = typeof codexLimitHistory.$inferSelect;
+export type CodexIndexCursorRow = typeof codexIndexCursors.$inferSelect;
+export type HydratedTaskRow = TaskRow & {
+  autoReviewState?: AutoReviewState | null;
+  runtimeLimitSnapshot?: RuntimeLimitSnapshot | null;
+};
 
 export type CoordinatorStage = "planner" | "plan-checker" | "implementer" | "reviewer";
+
+export interface RuntimeWarmupScopeInput {
+  projectId: string;
+  runtimeProfileId?: string | null;
+  runtimeId: string;
+  providerId: string;
+  transport?: string | null;
+  model?: string | null;
+}
+
+export interface CreateRuntimeWarmupSessionInput extends RuntimeWarmupScopeInput {
+  ttlSeconds: number;
+  expiresAt: string;
+  sourceSessionId?: string | null;
+  summary?: string | null;
+  createdAt?: string;
+}
 
 /** DB-level patch: all mutable task columns with their storage types (attachments/tags as JSON strings). */
 export type TaskFieldsPatch = Partial<Omit<TaskRow, "id" | "projectId" | "createdAt">> & {
@@ -86,17 +153,44 @@ export type TaskFieldsUpdate = {
   runtimeOptions?: Record<string, unknown> | null;
   position?: number;
   scheduledAt?: string | null;
+  worktreePath?: string | null;
 };
 
+function redactTaskTextForExternalUse(text: string | null | undefined): string | null {
+  if (typeof text !== "string") {
+    return text ?? null;
+  }
+  return text
+    .split(/\r?\n/)
+    .map((line) => redactProviderText(line))
+    .join("\n");
+}
+
+function parseTaskRuntimeLimitSnapshot(
+  raw: string | null | undefined,
+  taskId: string,
+): RuntimeLimitSnapshot | null {
+  const snapshot = parseRuntimeLimitSnapshot(raw, "task", taskId);
+  return snapshot ? sanitizeRuntimeLimitSnapshotForExposure(snapshot, "task") : null;
+}
 
 export function toTaskResponse(task: TaskRow): Task {
-  const { attachments, tags, runtimeOptionsJson, autoReviewStateJson, ...rest } = task;
+  const {
+    attachments,
+    tags,
+    runtimeOptionsJson,
+    autoReviewStateJson,
+    runtimeLimitSnapshotJson,
+    ...rest
+  } = task;
   return {
     ...rest,
     attachments: parseAttachments(attachments),
     tags: parseTags(tags),
     autoReviewState: parseAutoReviewState(autoReviewStateJson),
     runtimeOptions: parseRuntimeObject(runtimeOptionsJson),
+    agentActivityLog: redactTaskTextForExternalUse(task.agentActivityLog),
+    runtimeLimitSnapshot: parseTaskRuntimeLimitSnapshot(runtimeLimitSnapshotJson, task.id),
   };
 }
 
@@ -122,12 +216,193 @@ function parseRuntimeObject(raw: string | null | undefined): Record<string, unkn
   }
 }
 
+interface RuntimeProfileUsageState {
+  lastUsage: RuntimeProfileUsage;
+  lastUsageAt: string;
+}
+
+function toRuntimeProfileUsage(row: {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  costUsd: number | null;
+}): RuntimeProfileUsage {
+  return {
+    inputTokens: row.inputTokens,
+    outputTokens: row.outputTokens,
+    totalTokens: row.totalTokens,
+    costUsd: row.costUsd,
+  };
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasOwnProperty(record: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(record, key);
+}
+
+function readStoredOptionalFiniteNumber(
+  record: Record<string, unknown>,
+  key: string,
+): number | null | undefined {
+  if (!hasOwnProperty(record, key)) return undefined;
+  const value = record[key];
+  if (value == null) return null;
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function readStoredOptionalString(
+  record: Record<string, unknown>,
+  key: string,
+): string | null | undefined {
+  if (!hasOwnProperty(record, key)) return undefined;
+  const value = record[key];
+  if (value == null) return null;
+  return typeof value === "string" ? value : undefined;
+}
+
+function parseRuntimeLimitWindow(
+  value: unknown,
+  entity: "task" | "runtime_profile" | "codex_limit_head" | "codex_limit_history",
+  entityId: string,
+  index: number,
+  rawLength: number,
+): RuntimeLimitWindow | null {
+  if (!isObjectRecord(value) || typeof value.scope !== "string") {
+    log.warn(
+      { entity, entityId, index, rawLength },
+      "Malformed persisted runtime-limit window",
+    );
+    return null;
+  }
+
+  const name = readStoredOptionalString(value, "name");
+  const unit = readStoredOptionalString(value, "unit");
+  const limit = readStoredOptionalFiniteNumber(value, "limit");
+  const remaining = readStoredOptionalFiniteNumber(value, "remaining");
+  const used = readStoredOptionalFiniteNumber(value, "used");
+  const percentUsed = readStoredOptionalFiniteNumber(value, "percentUsed");
+  const percentRemaining = readStoredOptionalFiniteNumber(value, "percentRemaining");
+  const resetAt = readStoredOptionalString(value, "resetAt");
+  const retryAfterSeconds = readStoredOptionalFiniteNumber(value, "retryAfterSeconds");
+  const warningThreshold = readStoredOptionalFiniteNumber(value, "warningThreshold");
+
+  return {
+    scope: value.scope as RuntimeLimitWindow["scope"],
+    ...(name !== undefined ? { name } : {}),
+    ...(unit !== undefined ? { unit } : {}),
+    ...(limit !== undefined ? { limit } : {}),
+    ...(remaining !== undefined ? { remaining } : {}),
+    ...(used !== undefined ? { used } : {}),
+    ...(percentUsed !== undefined ? { percentUsed } : {}),
+    ...(percentRemaining !== undefined ? { percentRemaining } : {}),
+    ...(resetAt !== undefined ? { resetAt } : {}),
+    ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
+    ...(warningThreshold !== undefined ? { warningThreshold } : {}),
+  };
+}
+
+function parseRuntimeLimitSnapshot(
+  raw: string | null | undefined,
+  entity: "task" | "runtime_profile" | "codex_limit_head" | "codex_limit_history",
+  entityId: string,
+): RuntimeLimitSnapshot | null {
+  if (!raw) return null;
+
+  const warnMalformed = (reason: string, extra: Record<string, unknown> = {}) => {
+    log.warn(
+      { entity, entityId, reason, rawLength: raw.length, ...extra },
+      "Malformed persisted runtime-limit snapshot",
+    );
+  };
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isObjectRecord(parsed)) {
+      warnMalformed("root_not_object");
+      return null;
+    }
+
+    if (
+      typeof parsed.source !== "string" ||
+      typeof parsed.status !== "string" ||
+      typeof parsed.precision !== "string" ||
+      typeof parsed.checkedAt !== "string" ||
+      typeof parsed.providerId !== "string" ||
+      !Array.isArray(parsed.windows)
+    ) {
+      warnMalformed("missing_required_fields", {
+        hasSource: typeof parsed.source === "string",
+        hasStatus: typeof parsed.status === "string",
+        hasPrecision: typeof parsed.precision === "string",
+        hasCheckedAt: typeof parsed.checkedAt === "string",
+        hasProviderId: typeof parsed.providerId === "string",
+        hasWindows: Array.isArray(parsed.windows),
+      });
+      return null;
+    }
+
+    const windows: RuntimeLimitWindow[] = [];
+    for (const [index, window] of parsed.windows.entries()) {
+      const normalized = parseRuntimeLimitWindow(window, entity, entityId, index, raw.length);
+      if (!normalized) {
+        return null;
+      }
+      windows.push(normalized);
+    }
+
+    const runtimeId = readStoredOptionalString(parsed, "runtimeId");
+    const profileId = readStoredOptionalString(parsed, "profileId");
+    const primaryScope = readStoredOptionalString(parsed, "primaryScope");
+    const resetAt = readStoredOptionalString(parsed, "resetAt");
+    const retryAfterSeconds = readStoredOptionalFiniteNumber(parsed, "retryAfterSeconds");
+    const warningThreshold = readStoredOptionalFiniteNumber(parsed, "warningThreshold");
+    const providerMeta = hasOwnProperty(parsed, "providerMeta")
+      ? isObjectRecord(parsed.providerMeta)
+        ? parsed.providerMeta
+        : parsed.providerMeta == null
+          ? null
+          : undefined
+      : undefined;
+
+    return normalizeRuntimeLimitSnapshot({
+      source: parsed.source as RuntimeLimitSnapshot["source"],
+      status: parsed.status as RuntimeLimitSnapshot["status"],
+      precision: parsed.precision as RuntimeLimitSnapshot["precision"],
+      checkedAt: parsed.checkedAt,
+      providerId: parsed.providerId,
+      ...(runtimeId !== undefined ? { runtimeId } : {}),
+      ...(profileId !== undefined ? { profileId } : {}),
+      ...(primaryScope !== undefined
+        ? { primaryScope: primaryScope as RuntimeLimitSnapshot["primaryScope"] }
+        : {}),
+      ...(resetAt !== undefined ? { resetAt } : {}),
+      ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
+      ...(warningThreshold !== undefined ? { warningThreshold } : {}),
+      windows,
+      ...(providerMeta !== undefined ? { providerMeta } : {}),
+    });
+  } catch (error) {
+    warnMalformed("json_parse_failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+function serializeRuntimeLimitSnapshot(
+  snapshot: RuntimeLimitSnapshot | null | undefined,
+): string | null {
+  return snapshot == null ? null : JSON.stringify(snapshot);
+}
+
 function parseAutoReviewState(raw: string | null | undefined): AutoReviewState | null {
   if (!raw) return null;
 
-  const preview = raw.length > 200 ? `${raw.slice(0, 200)}...` : raw;
   const warnMalformed = (reason: string, extra: Record<string, unknown> = {}) => {
-    log.warn({ reason, raw: preview, ...extra }, "Malformed persisted auto-review payload");
+    log.warn({ reason, rawLength: raw.length, ...extra }, "Malformed persisted auto-review payload");
   };
 
   try {
@@ -249,6 +524,7 @@ export function findTaskById(id: string): HydratedTaskRow | undefined {
   return {
     ...row,
     autoReviewState: parseAutoReviewState(row.autoReviewStateJson),
+    runtimeLimitSnapshot: parseTaskRuntimeLimitSnapshot(row.runtimeLimitSnapshotJson, row.id),
   };
 }
 
@@ -270,8 +546,9 @@ export type TaskSummaryRow = Pick<TaskRow,
   | "id" | "projectId" | "title" | "status" | "priority" | "position"
   | "autoMode" | "isFix" | "paused" | "roadmapAlias" | "tags"
   | "runtimeProfileId" | "modelOverride"
-  | "blockedReason" | "blockedFromStatus" | "retryCount"
+  | "blockedReason" | "blockedFromStatus" | "retryAfter" | "retryCount"
   | "reworkRequested" | "reviewIterationCount" | "maxReviewIterations" | "manualReviewRequired"
+  | "runtimeLimitSnapshotJson" | "runtimeLimitUpdatedAt"
   | "tokenTotal" | "costUsd" | "lastSyncedAt" | "createdAt" | "updatedAt"
 >;
 
@@ -291,11 +568,14 @@ const SUMMARY_COLUMNS = {
   modelOverride: tasks.modelOverride,
   blockedReason: tasks.blockedReason,
   blockedFromStatus: tasks.blockedFromStatus,
+  retryAfter: tasks.retryAfter,
   retryCount: tasks.retryCount,
   reworkRequested: tasks.reworkRequested,
   reviewIterationCount: tasks.reviewIterationCount,
   maxReviewIterations: tasks.maxReviewIterations,
   manualReviewRequired: tasks.manualReviewRequired,
+  runtimeLimitSnapshotJson: tasks.runtimeLimitSnapshotJson,
+  runtimeLimitUpdatedAt: tasks.runtimeLimitUpdatedAt,
   tokenTotal: tasks.tokenTotal,
   costUsd: tasks.costUsd,
   lastSyncedAt: tasks.lastSyncedAt,
@@ -389,10 +669,11 @@ export function searchTasksPaginated(options: {
 
 /** Convert a TaskSummaryRow to a JSON-safe object (parse tags). */
 export function toTaskSummary(row: TaskSummaryRow) {
-  const { tags, ...rest } = row;
+  const { tags, runtimeLimitSnapshotJson, ...rest } = row;
   return {
     ...rest,
     tags: parseTags(tags),
+    runtimeLimitSnapshot: parseTaskRuntimeLimitSnapshot(runtimeLimitSnapshotJson, row.id),
   };
 }
 
@@ -533,6 +814,50 @@ export function setTaskFields(id: string, fields: TaskFieldsPatch): void {
   getDb().update(tasks).set(patch).where(eq(tasks.id, id)).run();
 }
 
+export function persistTaskRuntimeLimitSnapshot(
+  taskId: string,
+  snapshot: RuntimeLimitSnapshot,
+  persistedAt = new Date().toISOString(),
+): TaskRow | undefined {
+  const normalizedSnapshot = normalizeRuntimeLimitSnapshot(snapshot);
+  log.info(
+    {
+      taskId,
+      status: normalizedSnapshot.status,
+      source: normalizedSnapshot.source,
+      precision: normalizedSnapshot.precision,
+      resetAt: normalizedSnapshot.resetAt ?? null,
+      persistedAt,
+    },
+    "Persisting task runtime limit snapshot",
+  );
+  getDb()
+    .update(tasks)
+    .set({
+      runtimeLimitSnapshotJson: serializeRuntimeLimitSnapshot(normalizedSnapshot),
+      runtimeLimitUpdatedAt: persistedAt,
+    })
+    .where(eq(tasks.id, taskId))
+    .run();
+  return findTaskById(taskId);
+}
+
+export function clearTaskRuntimeLimitSnapshot(
+  taskId: string,
+  persistedAt = new Date().toISOString(),
+): TaskRow | undefined {
+  log.debug({ taskId, persistedAt }, "Clearing task runtime limit snapshot");
+  getDb()
+    .update(tasks)
+    .set({
+      runtimeLimitSnapshotJson: null,
+      runtimeLimitUpdatedAt: persistedAt,
+    })
+    .where(eq(tasks.id, taskId))
+    .run();
+  return findTaskById(taskId);
+}
+
 export function deleteTask(id: string): void {
   const db = getDb();
   db.delete(tasks).where(eq(tasks.id, id)).run();
@@ -596,6 +921,146 @@ export function getLatestReworkComment(taskId: string): CommentRow | undefined {
   return listTaskComments(taskId).at(-1);
 }
 
+export function toAppSettingsResponse(row: AppSettingsRow): AppSettings {
+  return {
+    id: row.id,
+    defaultTaskRuntimeProfileId: row.defaultTaskRuntimeProfileId,
+    defaultPlanRuntimeProfileId: row.defaultPlanRuntimeProfileId,
+    defaultReviewRuntimeProfileId: row.defaultReviewRuntimeProfileId,
+    defaultChatRuntimeProfileId: row.defaultChatRuntimeProfileId,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function ensureAppSettingsRow(): AppSettingsRow {
+  const db = getDb();
+  // Migration 13 seeds row id=1. Keep this fallback for legacy/test databases
+  // so read paths stay resilient even when they start from an empty schema.
+  const existing = db.select().from(appSettings).where(eq(appSettings.id, APP_SETTINGS_ID)).get();
+  if (existing) {
+    return existing;
+  }
+
+  const now = new Date().toISOString();
+  log.debug({ appSettingsId: APP_SETTINGS_ID }, "Seeding missing singleton app settings row");
+  db
+    .insert(appSettings)
+    .values({
+      id: APP_SETTINGS_ID,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .onConflictDoNothing()
+    .run();
+
+  return db.select().from(appSettings).where(eq(appSettings.id, APP_SETTINGS_ID)).get()!;
+}
+
+export function getAppSettings(): AppSettingsRow {
+  const settings = ensureAppSettingsRow();
+  log.debug({ appSettingsId: settings.id }, "Loaded app settings");
+  return settings;
+}
+
+export function updateAppSettings(input: UpdateAppSettingsInput): AppSettingsRow {
+  ensureAppSettingsRow();
+
+  const patch: Partial<AppSettingsRow> = {
+    updatedAt: new Date().toISOString(),
+  };
+  if (input.defaultTaskRuntimeProfileId !== undefined) {
+    patch.defaultTaskRuntimeProfileId = input.defaultTaskRuntimeProfileId;
+  }
+  if (input.defaultPlanRuntimeProfileId !== undefined) {
+    patch.defaultPlanRuntimeProfileId = input.defaultPlanRuntimeProfileId;
+  }
+  if (input.defaultReviewRuntimeProfileId !== undefined) {
+    patch.defaultReviewRuntimeProfileId = input.defaultReviewRuntimeProfileId;
+  }
+  if (input.defaultChatRuntimeProfileId !== undefined) {
+    patch.defaultChatRuntimeProfileId = input.defaultChatRuntimeProfileId;
+  }
+
+  log.debug(
+    {
+      appSettingsId: APP_SETTINGS_ID,
+      defaultTaskRuntimeProfileId: input.defaultTaskRuntimeProfileId ?? null,
+      defaultPlanRuntimeProfileId: input.defaultPlanRuntimeProfileId ?? null,
+      defaultReviewRuntimeProfileId: input.defaultReviewRuntimeProfileId ?? null,
+      defaultChatRuntimeProfileId: input.defaultChatRuntimeProfileId ?? null,
+    },
+    "Updating app settings runtime defaults",
+  );
+
+  getDb()
+    .update(appSettings)
+    .set(patch)
+    .where(eq(appSettings.id, APP_SETTINGS_ID))
+    .run();
+
+  return ensureAppSettingsRow();
+}
+
+export function getAppDefaultRuntimeProfileId(
+  mode: "task" | "plan" | "review" | "chat",
+): string | null {
+  const settings = getAppSettings();
+  const candidates =
+    mode === "chat"
+      ? [{ slot: "chat", profileId: settings.defaultChatRuntimeProfileId }]
+      : mode === "plan"
+        ? [
+            { slot: "plan", profileId: settings.defaultPlanRuntimeProfileId },
+            { slot: "task", profileId: settings.defaultTaskRuntimeProfileId },
+          ]
+        : mode === "review"
+          ? [
+              { slot: "review", profileId: settings.defaultReviewRuntimeProfileId },
+              { slot: "task", profileId: settings.defaultTaskRuntimeProfileId },
+            ]
+          : [{ slot: "task", profileId: settings.defaultTaskRuntimeProfileId }];
+
+  const seenProfileIds = new Set<string>();
+
+  for (const candidate of candidates) {
+    if (!candidate.profileId || seenProfileIds.has(candidate.profileId)) continue;
+    seenProfileIds.add(candidate.profileId);
+
+    const profile = findRuntimeProfileById(candidate.profileId);
+    if (!profile) {
+      log.warn(
+        { mode, appDefaultSlot: candidate.slot, runtimeProfileId: candidate.profileId },
+        "App runtime default points to a missing profile",
+      );
+      continue;
+    }
+    if (profile.projectId != null) {
+      log.warn(
+        {
+          mode,
+          appDefaultSlot: candidate.slot,
+          runtimeProfileId: candidate.profileId,
+          ownerProjectId: profile.projectId,
+        },
+        "App runtime default points to a project-scoped profile",
+      );
+      continue;
+    }
+    if (!profile.enabled) {
+      log.warn(
+        { mode, appDefaultSlot: candidate.slot, runtimeProfileId: candidate.profileId },
+        "App runtime default points to a disabled profile",
+      );
+      continue;
+    }
+
+    return profile.id;
+  }
+
+  return null;
+}
+
 export function listProjects(): ProjectRow[] {
   return getDb().select().from(projects).all();
 }
@@ -613,6 +1078,8 @@ export function createProject(input: {
   reviewSidecarMaxBudgetUsd?: number | null;
   parallelEnabled?: boolean;
   defaultTaskRuntimeProfileId?: string | null;
+  defaultPlanRuntimeProfileId?: string | null;
+  defaultReviewRuntimeProfileId?: string | null;
   defaultChatRuntimeProfileId?: string | null;
 }): ProjectRow | undefined {
   const id = crypto.randomUUID();
@@ -621,6 +1088,8 @@ export function createProject(input: {
     {
       projectId: id,
       defaultTaskRuntimeProfileId: input.defaultTaskRuntimeProfileId ?? null,
+      defaultPlanRuntimeProfileId: input.defaultPlanRuntimeProfileId ?? null,
+      defaultReviewRuntimeProfileId: input.defaultReviewRuntimeProfileId ?? null,
       defaultChatRuntimeProfileId: input.defaultChatRuntimeProfileId ?? null,
     },
     "Creating project runtime defaults",
@@ -637,6 +1106,8 @@ export function createProject(input: {
       reviewSidecarMaxBudgetUsd: input.reviewSidecarMaxBudgetUsd ?? null,
       parallelEnabled: input.parallelEnabled ?? false,
       defaultTaskRuntimeProfileId: input.defaultTaskRuntimeProfileId ?? null,
+      defaultPlanRuntimeProfileId: input.defaultPlanRuntimeProfileId ?? null,
+      defaultReviewRuntimeProfileId: input.defaultReviewRuntimeProfileId ?? null,
       defaultChatRuntimeProfileId: input.defaultChatRuntimeProfileId ?? null,
       createdAt: now,
       updatedAt: now,
@@ -661,32 +1132,42 @@ export function updateProject(
     defaultChatRuntimeProfileId?: string | null;
   },
 ): ProjectRow | undefined {
+  const patch: Partial<ProjectRow> = {
+    name: input.name,
+    rootPath: input.rootPath,
+    plannerMaxBudgetUsd: input.plannerMaxBudgetUsd ?? null,
+    planCheckerMaxBudgetUsd: input.planCheckerMaxBudgetUsd ?? null,
+    implementerMaxBudgetUsd: input.implementerMaxBudgetUsd ?? null,
+    reviewSidecarMaxBudgetUsd: input.reviewSidecarMaxBudgetUsd ?? null,
+    parallelEnabled: input.parallelEnabled ?? false,
+    updatedAt: new Date().toISOString(),
+  };
+  if (input.defaultTaskRuntimeProfileId !== undefined) {
+    patch.defaultTaskRuntimeProfileId = input.defaultTaskRuntimeProfileId;
+  }
+  if (input.defaultPlanRuntimeProfileId !== undefined) {
+    patch.defaultPlanRuntimeProfileId = input.defaultPlanRuntimeProfileId;
+  }
+  if (input.defaultReviewRuntimeProfileId !== undefined) {
+    patch.defaultReviewRuntimeProfileId = input.defaultReviewRuntimeProfileId;
+  }
+  if (input.defaultChatRuntimeProfileId !== undefined) {
+    patch.defaultChatRuntimeProfileId = input.defaultChatRuntimeProfileId;
+  }
+
   log.debug(
     {
       projectId: id,
-      defaultTaskRuntimeProfileId: input.defaultTaskRuntimeProfileId ?? null,
-      defaultPlanRuntimeProfileId: input.defaultPlanRuntimeProfileId ?? null,
-      defaultReviewRuntimeProfileId: input.defaultReviewRuntimeProfileId ?? null,
-      defaultChatRuntimeProfileId: input.defaultChatRuntimeProfileId ?? null,
+      defaultTaskRuntimeProfileId: patch.defaultTaskRuntimeProfileId ?? null,
+      defaultPlanRuntimeProfileId: patch.defaultPlanRuntimeProfileId ?? null,
+      defaultReviewRuntimeProfileId: patch.defaultReviewRuntimeProfileId ?? null,
+      defaultChatRuntimeProfileId: patch.defaultChatRuntimeProfileId ?? null,
     },
     "Updating project runtime defaults",
   );
   getDb()
     .update(projects)
-    .set({
-      name: input.name,
-      rootPath: input.rootPath,
-      plannerMaxBudgetUsd: input.plannerMaxBudgetUsd ?? null,
-      planCheckerMaxBudgetUsd: input.planCheckerMaxBudgetUsd ?? null,
-      implementerMaxBudgetUsd: input.implementerMaxBudgetUsd ?? null,
-      reviewSidecarMaxBudgetUsd: input.reviewSidecarMaxBudgetUsd ?? null,
-      parallelEnabled: input.parallelEnabled ?? false,
-      defaultTaskRuntimeProfileId: input.defaultTaskRuntimeProfileId ?? null,
-      defaultPlanRuntimeProfileId: input.defaultPlanRuntimeProfileId ?? null,
-      defaultReviewRuntimeProfileId: input.defaultReviewRuntimeProfileId ?? null,
-      defaultChatRuntimeProfileId: input.defaultChatRuntimeProfileId ?? null,
-      updatedAt: new Date().toISOString(),
-    })
+    .set(patch)
     .where(eq(projects.id, id))
     .run();
   return findProjectById(id);
@@ -776,6 +1257,56 @@ export function claimTask(taskId: string, coordinatorId: string, lockDurationMs:
   return result.changes > 0;
 }
 
+/**
+ * Conditional proactive runtime gate block (CAS).
+ * Applies the block only if the candidate row is still in the expected state
+ * and remains available (unpaused + unlocked) at write time.
+ */
+export function blockTaskForRuntimeGateIfEligible(input: {
+  taskId: string;
+  expectedProjectId?: string | null;
+  expectedStatus: TaskStatus;
+  expectedAutoMode?: boolean;
+  blockedFromStatus: TaskStatus;
+  blockedReason: string;
+  retryAfter: string | null;
+  retryCount: number;
+  snapshot: RuntimeLimitSnapshot | null;
+  persistedAt?: string;
+}): boolean {
+  const nowIso = input.persistedAt ?? new Date().toISOString();
+  const normalizedSnapshot = input.snapshot ? normalizeRuntimeLimitSnapshot(input.snapshot) : null;
+  const conditions = [
+    eq(tasks.id, input.taskId),
+    eq(tasks.status, input.expectedStatus),
+    eq(tasks.paused, false),
+    or(sql`${tasks.lockedBy} IS NULL`, lte(tasks.lockedUntil, nowIso)),
+  ];
+  if (input.expectedProjectId != null) {
+    conditions.push(eq(tasks.projectId, input.expectedProjectId));
+  }
+  if (input.expectedAutoMode != null) {
+    conditions.push(eq(tasks.autoMode, input.expectedAutoMode));
+  }
+
+  const result = getDb()
+    .update(tasks)
+    .set({
+      status: "blocked_external",
+      blockedFromStatus: input.blockedFromStatus,
+      blockedReason: input.blockedReason,
+      retryAfter: input.retryAfter,
+      retryCount: input.retryCount,
+      runtimeLimitSnapshotJson: serializeRuntimeLimitSnapshot(normalizedSnapshot),
+      runtimeLimitUpdatedAt: nowIso,
+      updatedAt: nowIso,
+    })
+    .where(and(...conditions))
+    .run();
+
+  return result.changes > 0;
+}
+
 /** Check if any task in a project is currently locked (active, non-expired). */
 /**
  * Conditional advance from `backlog` to `planning`. Returns `true` only if
@@ -830,6 +1361,39 @@ export function countActivePipelineTasksForProject(projectId: string): number {
     )
     .get();
   return row?.cnt ?? 0;
+}
+
+/**
+ * True if the project has at least one in-flight task with a persisted
+ * `branchName` but no isolated `worktreePath`. Used by the auto-queue
+ * scheduler to keep parallel execution disabled for legacy branch-bound
+ * tasks that still mutate the shared worktree on stage transitions.
+ *
+ * Includes `backlog` so a queued task whose branch was prepared (e.g. via
+ * `accept_existing_plan`) does not let the scheduler open the parallel pool
+ * before its first stage starts.
+ */
+export function hasActiveBranchBoundTasksForProject(projectId: string): boolean {
+  const row = getDb()
+    .select({ cnt: count() })
+    .from(tasks)
+    .where(
+      and(
+        eq(tasks.projectId, projectId),
+        isNotNull(tasks.branchName),
+        isNull(tasks.worktreePath),
+        inArray(tasks.status, [
+          "backlog",
+          "planning",
+          "plan_ready",
+          "implementing",
+          "review",
+          "blocked_external",
+        ]),
+      ),
+    )
+    .get();
+  return (row?.cnt ?? 0) > 0;
 }
 
 export function hasActiveLockedTaskForProject(projectId: string): boolean {
@@ -1168,6 +1732,10 @@ export interface DbUsageSink {
   record(event: DbUsageEvent): void;
 }
 
+export interface CreateDbUsageSinkOptions {
+  onRecorded?: (event: DbUsageEvent) => void;
+}
+
 /**
  * Insert a `usage_events` row and roll the usage delta into whichever
  * per-entity aggregate counters the event has scope for (task, project,
@@ -1254,11 +1822,23 @@ export function recordUsageEvent(event: DbUsageEvent): void {
  * `recordUsageEvent`. Sink methods are non-throwing: any DB error is logged
  * and swallowed so a broken sink never breaks the caller mid-run.
  */
-export function createDbUsageSink(): DbUsageSink {
+export function createDbUsageSink(options: CreateDbUsageSinkOptions = {}): DbUsageSink {
   return {
     record(event) {
       try {
         recordUsageEvent(event);
+        try {
+          options.onRecorded?.(event);
+        } catch (callbackError) {
+          log.warn(
+            {
+              err: callbackError,
+              runtimeId: event.runtimeId,
+              source: event.context.source,
+            },
+            "Usage sink onRecorded callback failed",
+          );
+        }
       } catch (err) {
         log.error(
           {
@@ -1319,9 +1899,242 @@ export function findTasksByRoadmapAlias(projectId: string, alias: string): TaskR
     .all();
 }
 
+// ── Runtime Warmup Sessions ──────────────────────────────────────────
+
+const ACTIVE_RUNTIME_WARMUP_STATUSES: RuntimeWarmupSessionStatus[] = ["creating", "ready"];
+
+function runtimeWarmupScopeConditions(input: RuntimeWarmupScopeInput) {
+  return [
+    eq(runtimeWarmupSessions.projectId, input.projectId),
+    input.runtimeProfileId == null
+      ? isNull(runtimeWarmupSessions.runtimeProfileId)
+      : eq(runtimeWarmupSessions.runtimeProfileId, input.runtimeProfileId),
+    eq(runtimeWarmupSessions.runtimeId, input.runtimeId),
+    eq(runtimeWarmupSessions.providerId, input.providerId),
+    input.transport == null
+      ? isNull(runtimeWarmupSessions.transport)
+      : eq(runtimeWarmupSessions.transport, input.transport),
+    input.model == null
+      ? isNull(runtimeWarmupSessions.model)
+      : eq(runtimeWarmupSessions.model, input.model),
+  ];
+}
+
+export function findRuntimeWarmupSessionById(
+  id: string,
+): RuntimeWarmupSessionRow | undefined {
+  return getDb()
+    .select()
+    .from(runtimeWarmupSessions)
+    .where(eq(runtimeWarmupSessions.id, id))
+    .get();
+}
+
+export function createRuntimeWarmupSession(
+  input: CreateRuntimeWarmupSessionInput,
+): RuntimeWarmupSessionRow | undefined {
+  const db = getDb();
+  const id = crypto.randomUUID();
+  const now = input.createdAt ?? new Date().toISOString();
+
+  db.insert(runtimeWarmupSessions)
+    .values({
+      id,
+      projectId: input.projectId,
+      runtimeProfileId: input.runtimeProfileId ?? null,
+      runtimeId: input.runtimeId,
+      providerId: input.providerId,
+      transport: input.transport ?? null,
+      model: input.model ?? null,
+      sourceSessionId: input.sourceSessionId ?? null,
+      status: "creating",
+      ttlSeconds: input.ttlSeconds,
+      expiresAt: input.expiresAt,
+      summary: input.summary ?? null,
+      errorMessage: null,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .run();
+
+  return findRuntimeWarmupSessionById(id);
+}
+
+export function markRuntimeWarmupSessionReady(
+  id: string,
+  input: {
+    sourceSessionId: string;
+    summary?: string | null;
+    expiresAt?: string;
+    ttlSeconds?: number;
+    updatedAt?: string;
+  },
+): RuntimeWarmupSessionRow | undefined {
+  const now = input.updatedAt ?? new Date().toISOString();
+  getDb().transaction((tx) => {
+    const existing = tx
+      .select()
+      .from(runtimeWarmupSessions)
+      .where(eq(runtimeWarmupSessions.id, id))
+      .get();
+    if (!existing) return;
+
+    const readyUpdate = tx
+      .update(runtimeWarmupSessions)
+      .set({
+        status: "ready",
+        sourceSessionId: input.sourceSessionId,
+        summary: input.summary ?? null,
+        errorMessage: null,
+        ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
+        ...(input.ttlSeconds !== undefined ? { ttlSeconds: input.ttlSeconds } : {}),
+        updatedAt: now,
+      })
+      .where(and(eq(runtimeWarmupSessions.id, id), eq(runtimeWarmupSessions.status, "creating")))
+      .run();
+    if (readyUpdate.changes === 0) return;
+
+    tx.update(runtimeWarmupSessions)
+      .set({ status: "cleared", updatedAt: now })
+      .where(
+        and(
+          ...runtimeWarmupScopeConditions(existing),
+          inArray(runtimeWarmupSessions.status, ACTIVE_RUNTIME_WARMUP_STATUSES),
+          ne(runtimeWarmupSessions.id, id),
+        ),
+      )
+      .run();
+  });
+  return findRuntimeWarmupSessionById(id);
+}
+
+export function markRuntimeWarmupSessionFailed(
+  id: string,
+  errorMessage: string,
+  updatedAt = new Date().toISOString(),
+): RuntimeWarmupSessionRow | undefined {
+  getDb()
+    .update(runtimeWarmupSessions)
+    .set({
+      status: "failed",
+      errorMessage,
+      updatedAt,
+    })
+    .where(eq(runtimeWarmupSessions.id, id))
+    .run();
+  return findRuntimeWarmupSessionById(id);
+}
+
+export function clearActiveRuntimeWarmupSessions(
+  input: RuntimeWarmupScopeInput,
+  updatedAt = new Date().toISOString(),
+): number {
+  const result = getDb()
+    .update(runtimeWarmupSessions)
+    .set({ status: "cleared", updatedAt })
+    .where(
+      and(
+        ...runtimeWarmupScopeConditions(input),
+        inArray(runtimeWarmupSessions.status, ACTIVE_RUNTIME_WARMUP_STATUSES),
+      ),
+    )
+    .run();
+  return result.changes;
+}
+
+export function expireStaleRuntimeWarmupSessions(
+  nowIso = new Date().toISOString(),
+): number {
+  const result = getDb()
+    .update(runtimeWarmupSessions)
+    .set({ status: "expired", updatedAt: nowIso })
+    .where(
+      and(
+        inArray(runtimeWarmupSessions.status, ACTIVE_RUNTIME_WARMUP_STATUSES),
+        lte(runtimeWarmupSessions.expiresAt, nowIso),
+      ),
+    )
+    .run();
+  return result.changes;
+}
+
+export function findActiveReadyRuntimeWarmupSession(
+  input: RuntimeWarmupScopeInput,
+  nowIso = new Date().toISOString(),
+): RuntimeWarmupSessionRow | undefined {
+  return getDb()
+    .select()
+    .from(runtimeWarmupSessions)
+    .where(
+      and(
+        ...runtimeWarmupScopeConditions(input),
+        eq(runtimeWarmupSessions.status, "ready"),
+        isNotNull(runtimeWarmupSessions.sourceSessionId),
+        gt(runtimeWarmupSessions.expiresAt, nowIso),
+      ),
+    )
+    .orderBy(desc(runtimeWarmupSessions.updatedAt))
+    .limit(1)
+    .get();
+}
+
 // ── Runtime Profiles ──────────────────────────────────────────
 
-export function toRuntimeProfileResponse(row: RuntimeProfileRow): RuntimeProfile {
+function findLatestRuntimeProfileUsageByIds(
+  profileIds: string[],
+): Map<string, RuntimeProfileUsageState> {
+  const uniqueProfileIds = Array.from(new Set(profileIds.filter((value) => value.length > 0)));
+  if (uniqueProfileIds.length === 0) {
+    return new Map();
+  }
+
+  const db = getDb();
+  const latestUsageByProfile = db
+    .select({
+      profileId: usageEvents.profileId,
+      latestCreatedAt: max(usageEvents.createdAt).as("latest_created_at"),
+    })
+    .from(usageEvents)
+    .where(and(isNotNull(usageEvents.profileId), inArray(usageEvents.profileId, uniqueProfileIds)))
+    .groupBy(usageEvents.profileId)
+    .as("latest_usage_by_profile");
+
+  const rows = db
+    .select({
+      profileId: usageEvents.profileId,
+      inputTokens: usageEvents.inputTokens,
+      outputTokens: usageEvents.outputTokens,
+      totalTokens: usageEvents.totalTokens,
+      costUsd: usageEvents.costUsd,
+      createdAt: usageEvents.createdAt,
+    })
+    .from(usageEvents)
+    .innerJoin(
+      latestUsageByProfile,
+      and(
+        eq(usageEvents.profileId, latestUsageByProfile.profileId),
+        eq(usageEvents.createdAt, latestUsageByProfile.latestCreatedAt),
+      ),
+    )
+    .all();
+
+  const usageByProfileId = new Map<string, RuntimeProfileUsageState>();
+  for (const row of rows) {
+    if (!row.profileId) continue;
+    if (usageByProfileId.has(row.profileId)) continue;
+    usageByProfileId.set(row.profileId, {
+      lastUsage: toRuntimeProfileUsage(row),
+      lastUsageAt: row.createdAt,
+    });
+  }
+
+  return usageByProfileId;
+}
+
+export function toRuntimeProfileResponse(
+  row: RuntimeProfileRow,
+  usageState: RuntimeProfileUsageState | null = null,
+): RuntimeProfile {
   return {
     id: row.id,
     projectId: row.projectId,
@@ -1335,6 +2148,14 @@ export function toRuntimeProfileResponse(row: RuntimeProfileRow): RuntimeProfile
     headers: parseRuntimeHeaders(row.headersJson),
     options: parseRuntimeObject(row.optionsJson) ?? {},
     enabled: row.enabled,
+    runtimeLimitSnapshot: parseRuntimeLimitSnapshot(
+      row.runtimeLimitSnapshotJson,
+      "runtime_profile",
+      row.id,
+    ),
+    runtimeLimitUpdatedAt: row.runtimeLimitUpdatedAt ?? null,
+    lastUsage: usageState?.lastUsage ?? null,
+    lastUsageAt: usageState?.lastUsageAt ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -1342,6 +2163,13 @@ export function toRuntimeProfileResponse(row: RuntimeProfileRow): RuntimeProfile
 
 export function findRuntimeProfileById(id: string): RuntimeProfileRow | undefined {
   return getDb().select().from(runtimeProfiles).where(eq(runtimeProfiles.id, id)).get();
+}
+
+export function getRuntimeProfileResponseById(id: string): RuntimeProfile | undefined {
+  const row = findRuntimeProfileById(id);
+  if (!row) return undefined;
+  const usageState = findLatestRuntimeProfileUsageByIds([id]).get(id) ?? null;
+  return toRuntimeProfileResponse(row, usageState);
 }
 
 export function listRuntimeProfiles(input: {
@@ -1376,6 +2204,32 @@ export function listRuntimeProfiles(input: {
     .where(where)
     .orderBy(asc(runtimeProfiles.createdAt))
     .all();
+}
+
+export function listRuntimeProfileResponses(input: {
+  projectId?: string;
+  includeGlobal?: boolean;
+  enabledOnly?: boolean;
+} = {}): RuntimeProfile[] {
+  const rows = listRuntimeProfiles(input);
+  const usageByProfileId = findLatestRuntimeProfileUsageByIds(rows.map((row) => row.id));
+  return rows.map((row) => toRuntimeProfileResponse(row, usageByProfileId.get(row.id) ?? null));
+}
+
+function getProjectRuntimeProfileId(
+  project: ProjectRow | undefined,
+  mode: "task" | "plan" | "review" | "chat",
+): string | null {
+  if (mode === "chat") {
+    return project?.defaultChatRuntimeProfileId ?? null;
+  }
+  if (mode === "plan") {
+    return project?.defaultPlanRuntimeProfileId ?? project?.defaultTaskRuntimeProfileId ?? null;
+  }
+  if (mode === "review") {
+    return project?.defaultReviewRuntimeProfileId ?? project?.defaultTaskRuntimeProfileId ?? null;
+  }
+  return project?.defaultTaskRuntimeProfileId ?? null;
 }
 
 export function createRuntimeProfile(input: CreateRuntimeProfileInput): RuntimeProfileRow | undefined {
@@ -1446,9 +2300,109 @@ export function updateRuntimeProfile(
   return findRuntimeProfileById(id);
 }
 
+export function persistRuntimeProfileLimitSnapshot(
+  runtimeProfileId: string,
+  snapshot: RuntimeLimitSnapshot,
+  persistedAt = new Date().toISOString(),
+): RuntimeProfileRow | undefined {
+  if (!getEnv().AIF_USAGE_LIMITS_ENABLED) {
+    return findRuntimeProfileById(runtimeProfileId);
+  }
+
+  const normalizedSnapshot = normalizeRuntimeLimitSnapshot(snapshot);
+  log.info(
+    {
+      runtimeProfileId,
+      status: normalizedSnapshot.status,
+      source: normalizedSnapshot.source,
+      precision: normalizedSnapshot.precision,
+      resetAt: normalizedSnapshot.resetAt ?? null,
+      persistedAt,
+    },
+    "Persisting runtime profile limit snapshot",
+  );
+  getDb()
+    .update(runtimeProfiles)
+    .set({
+      runtimeLimitSnapshotJson: serializeRuntimeLimitSnapshot(normalizedSnapshot),
+      runtimeLimitUpdatedAt: persistedAt,
+    })
+    .where(eq(runtimeProfiles.id, runtimeProfileId))
+    .run();
+  return findRuntimeProfileById(runtimeProfileId);
+}
+
+export function clearRuntimeProfileLimitSnapshot(
+  runtimeProfileId: string,
+  persistedAt = new Date().toISOString(),
+): RuntimeProfileRow | undefined {
+  if (!getEnv().AIF_USAGE_LIMITS_ENABLED) {
+    return findRuntimeProfileById(runtimeProfileId);
+  }
+
+  log.debug({ runtimeProfileId, persistedAt }, "Clearing runtime profile limit snapshot");
+  getDb()
+    .update(runtimeProfiles)
+    .set({
+      runtimeLimitSnapshotJson: null,
+      runtimeLimitUpdatedAt: persistedAt,
+    })
+    .where(eq(runtimeProfiles.id, runtimeProfileId))
+    .run();
+  return findRuntimeProfileById(runtimeProfileId);
+}
+
 export function deleteRuntimeProfile(id: string): void {
   log.debug({ runtimeProfileId: id }, "Deleting runtime profile");
   getDb().delete(runtimeProfiles).where(eq(runtimeProfiles.id, id)).run();
+}
+
+export function isRuntimeProfileVisibleToProject(input: {
+  projectId: string;
+  runtimeProfileId: string | null;
+}): boolean {
+  if (input.runtimeProfileId == null) {
+    log.debug({ projectId: input.projectId, runtimeProfileId: null }, "Null runtime profile is visible");
+    return true;
+  }
+
+  const profile = findRuntimeProfileById(input.runtimeProfileId);
+  const isVisible =
+    profile != null && (profile.projectId == null || profile.projectId === input.projectId);
+
+  log.debug(
+    {
+      projectId: input.projectId,
+      runtimeProfileId: input.runtimeProfileId,
+      ownerProjectId: profile?.projectId ?? null,
+      isVisible,
+    },
+    "Checked runtime profile visibility for project",
+  );
+
+  return isVisible;
+}
+
+export function isRuntimeProfileEligibleForAppDefaults(runtimeProfileId: string | null): boolean {
+  if (runtimeProfileId == null) {
+    log.debug({ runtimeProfileId: null }, "Null runtime profile is eligible for app defaults");
+    return true;
+  }
+
+  const profile = findRuntimeProfileById(runtimeProfileId);
+  const isEligible = profile != null && profile.projectId == null && profile.enabled;
+
+  log.debug(
+    {
+      runtimeProfileId,
+      ownerProjectId: profile?.projectId ?? null,
+      enabled: profile?.enabled ?? null,
+      isEligible,
+    },
+    "Checked runtime profile eligibility for app defaults",
+  );
+
+  return isEligible;
 }
 
 export function updateProjectRuntimeDefaults(
@@ -1529,6 +2483,118 @@ export function updateChatSessionRuntime(
   return findChatSessionById(sessionId);
 }
 
+export interface RuntimeLimitGateDecision {
+  blocked: boolean;
+  reason: "none" | "provider_blocked" | "exact_threshold";
+  runtimeProfileId: string | null;
+  snapshot: RuntimeLimitSnapshot | null;
+  futureHint: RuntimeLimitFutureHint;
+  violatedWindow: RuntimeLimitWindow | null;
+  signature: string | null;
+}
+
+export function evaluateRuntimeLimitGate(
+  profile: RuntimeProfile | null | undefined,
+  nowMs = Date.now(),
+): RuntimeLimitGateDecision {
+  const runtimeProfileId = profile?.id ?? null;
+  if (!getEnv().AIF_USAGE_LIMITS_ENABLED) {
+    return {
+      blocked: false,
+      reason: "none",
+      runtimeProfileId,
+      snapshot: null,
+      futureHint: resolveRuntimeLimitFutureHint(null, { nowMs }),
+      violatedWindow: null,
+      signature: null,
+    };
+  }
+
+  const snapshot = profile?.runtimeLimitSnapshot ?? null;
+  if (!snapshot) {
+    return {
+      blocked: false,
+      reason: "none",
+      runtimeProfileId,
+      snapshot: null,
+      futureHint: resolveRuntimeLimitFutureHint(null, { nowMs }),
+      violatedWindow: null,
+      signature: null,
+    };
+  }
+
+  const signature = buildRuntimeLimitSignature(snapshot);
+  const providerBlockedHint = resolveRuntimeLimitFutureHint(snapshot, { nowMs });
+
+  if (snapshot.status === "blocked" && providerBlockedHint.source === "none") {
+    log.debug(
+      {
+        runtimeProfileId,
+        status: snapshot.status,
+        precision: snapshot.precision,
+        checkedAt: snapshot.checkedAt,
+        signature,
+      },
+      "Skipping proactive runtime gate because the persisted snapshot has no reset hint",
+    );
+  }
+  if (snapshot.status === "blocked" && providerBlockedHint.isFuture) {
+    return {
+      blocked: true,
+      reason: "provider_blocked",
+      runtimeProfileId,
+      snapshot,
+      futureHint: providerBlockedHint,
+      violatedWindow: null,
+      signature,
+    };
+  }
+
+  const violatedWindow = selectViolatedWindowForExactThreshold(snapshot, null, nowMs);
+  const exactThresholdReached =
+    snapshot.precision === "exact" && snapshot.status === "warning" && violatedWindow != null;
+  const exactThresholdHint = resolveRuntimeLimitFutureHint(snapshot, {
+    nowMs,
+    preferredWindow: violatedWindow,
+    windowFirst: true,
+  });
+
+  if (exactThresholdReached && exactThresholdHint.source === "none") {
+    log.debug(
+      {
+        runtimeProfileId,
+        status: snapshot.status,
+        precision: snapshot.precision,
+        checkedAt: snapshot.checkedAt,
+        signature,
+      },
+      "Skipping proactive exact-threshold gate because the violated window has no reset hint",
+    );
+  }
+
+  if (exactThresholdReached && exactThresholdHint.isFuture) {
+    return {
+      blocked: true,
+      reason: "exact_threshold",
+      runtimeProfileId,
+      snapshot,
+      futureHint: exactThresholdHint,
+      violatedWindow,
+      signature,
+    };
+  }
+
+  return {
+    blocked: false,
+    reason: "none",
+    runtimeProfileId,
+    snapshot,
+    futureHint: providerBlockedHint,
+    violatedWindow: violatedWindow ?? null,
+    signature,
+  };
+}
+
 export function resolveEffectiveRuntimeProfile(input: {
   taskId?: string;
   projectId?: string;
@@ -1544,16 +2610,7 @@ export function resolveEffectiveRuntimeProfile(input: {
   // pipeline (plan, implement, review, chat) runs on the specified runtime.
   const taskRuntimeProfileId = task?.runtimeProfileId ?? null;
 
-  let projectRuntimeProfileId: string | null = null;
-  if (mode === "chat") {
-    projectRuntimeProfileId = project?.defaultChatRuntimeProfileId ?? null;
-  } else if (mode === "plan") {
-    projectRuntimeProfileId = project?.defaultPlanRuntimeProfileId ?? project?.defaultTaskRuntimeProfileId ?? null;
-  } else if (mode === "review") {
-    projectRuntimeProfileId = project?.defaultReviewRuntimeProfileId ?? project?.defaultTaskRuntimeProfileId ?? null;
-  } else {
-    projectRuntimeProfileId = project?.defaultTaskRuntimeProfileId ?? null;
-  }
+  const projectRuntimeProfileId = getProjectRuntimeProfileId(project, mode);
   const systemRuntimeProfileId = input.systemDefaultRuntimeProfileId ?? null;
 
   const candidates: Array<{
@@ -1575,7 +2632,7 @@ export function resolveEffectiveRuntimeProfile(input: {
       continue;
     }
 
-    if (candidate.source !== "task_override") {
+    if (candidate.source !== "task_override" && unavailableIds.length > 0) {
       log.info(
         {
           source: candidate.source,
@@ -1590,7 +2647,10 @@ export function resolveEffectiveRuntimeProfile(input: {
 
     return {
       source: candidate.source,
-      profile: toRuntimeProfileResponse(profile),
+      profile: toRuntimeProfileResponse(
+        profile,
+        findLatestRuntimeProfileUsageByIds([profile.id]).get(profile.id) ?? null,
+      ),
       taskRuntimeProfileId,
       projectRuntimeProfileId,
       systemRuntimeProfileId,
@@ -1604,6 +2664,137 @@ export function resolveEffectiveRuntimeProfile(input: {
     projectRuntimeProfileId,
     systemRuntimeProfileId,
   };
+}
+
+// ── Runtime Profile Resolution ─────────────────────────────────
+
+type RuntimeResolvableTask = Pick<TaskRow, "id" | "projectId" | "runtimeProfileId">;
+
+export function resolveEffectiveRuntimeProfilesForTasks(
+  taskRows: RuntimeResolvableTask[],
+  input: {
+    mode?: "task" | "plan" | "review" | "chat";
+    systemDefaultRuntimeProfileId?: string | null;
+  } = {},
+): Map<string, EffectiveRuntimeProfileSelection> {
+  const mode = input.mode ?? "task";
+  const systemRuntimeProfileId = input.systemDefaultRuntimeProfileId ?? null;
+  const results = new Map<string, EffectiveRuntimeProfileSelection>();
+  if (taskRows.length === 0) {
+    return results;
+  }
+
+  const db = getDb();
+  const projectIds = Array.from(new Set(taskRows.map((task) => task.projectId)));
+  const projectRows =
+    projectIds.length > 0
+      ? db.select().from(projects).where(inArray(projects.id, projectIds)).all()
+      : [];
+  const projectById = new Map(projectRows.map((project) => [project.id, project]));
+
+  const candidatesByTaskId = new Map<
+    string,
+    Array<{
+      source: EffectiveRuntimeProfileSelection["source"];
+      profileId: string | null;
+    }>
+  >();
+  const profileIds = new Set<string>();
+
+  for (const task of taskRows) {
+    const project = projectById.get(task.projectId);
+    const taskRuntimeProfileId = task.runtimeProfileId ?? null;
+    const projectRuntimeProfileId = getProjectRuntimeProfileId(project, mode);
+    const candidates: Array<{
+      source: EffectiveRuntimeProfileSelection["source"];
+      profileId: string | null;
+    }> = [
+      { source: "task_override", profileId: taskRuntimeProfileId },
+      { source: "project_default", profileId: projectRuntimeProfileId },
+      { source: "system_default", profileId: systemRuntimeProfileId },
+    ];
+    candidatesByTaskId.set(task.id, candidates);
+
+    for (const candidate of candidates) {
+      if (candidate.profileId) {
+        profileIds.add(candidate.profileId);
+      }
+    }
+  }
+
+  const uniqueProfileIds = Array.from(profileIds);
+  const profileRows =
+    uniqueProfileIds.length > 0
+      ? db.select().from(runtimeProfiles).where(inArray(runtimeProfiles.id, uniqueProfileIds)).all()
+      : [];
+  const profileById = new Map(profileRows.map((profile) => [profile.id, profile]));
+  const usageByProfileId = findLatestRuntimeProfileUsageByIds(uniqueProfileIds);
+
+  let fallbackLogCount = 0;
+  for (const task of taskRows) {
+    const project = projectById.get(task.projectId);
+    const taskRuntimeProfileId = task.runtimeProfileId ?? null;
+    const projectRuntimeProfileId = getProjectRuntimeProfileId(project, mode);
+    const candidates = candidatesByTaskId.get(task.id) ?? [];
+    const unavailableIds: string[] = [];
+
+    for (const candidate of candidates) {
+      if (!candidate.profileId) continue;
+      const profile = profileById.get(candidate.profileId);
+      if (!profile || !profile.enabled) {
+        unavailableIds.push(candidate.profileId);
+        continue;
+      }
+
+      if (candidate.source !== "task_override" && unavailableIds.length > 0) {
+        fallbackLogCount += 1;
+        log.info(
+          {
+            source: candidate.source,
+            taskRuntimeProfileId,
+            projectRuntimeProfileId,
+            systemRuntimeProfileId,
+            unavailableCount: unavailableIds.length,
+          },
+          "Effective runtime profile fell back from higher-priority source",
+        );
+      }
+
+      results.set(task.id, {
+        source: candidate.source,
+        profile: toRuntimeProfileResponse(
+          profile,
+          usageByProfileId.get(profile.id) ?? null,
+        ),
+        taskRuntimeProfileId,
+        projectRuntimeProfileId,
+        systemRuntimeProfileId,
+      });
+      break;
+    }
+
+    if (!results.has(task.id)) {
+      results.set(task.id, {
+        source: "none",
+        profile: null,
+        taskRuntimeProfileId,
+        projectRuntimeProfileId,
+        systemRuntimeProfileId,
+      });
+    }
+  }
+
+  log.debug(
+    {
+      taskCount: taskRows.length,
+      projectCount: projectById.size,
+      candidateProfileCount: profileById.size,
+      fallbackLogCount,
+    },
+    "Resolved effective runtime profiles for task list",
+  );
+
+  return results;
 }
 
 // ── Chat Sessions ──────────────────────────────────────────────
@@ -1759,4 +2950,912 @@ export function updateChatSessionTimestamp(id: string): void {
     .set({ updatedAt: new Date().toISOString() })
     .where(eq(chatSessions.id, id))
     .run();
+}
+
+// - Codex index repository (session read-model + limit overlays) -
+
+export interface UpsertCodexSessionInput {
+  sessionId: string;
+  filePath: string;
+  title?: string | null;
+  projectRoot?: string | null;
+  accountFingerprint?: string | null;
+  sourceCreatedAt?: string | null;
+  sourceUpdatedAt?: string | null;
+  messageCount?: number;
+  previewText?: string | null;
+  sizeBytes: number;
+  mtimeMs: number;
+  lastIndexedAt?: string;
+}
+
+export interface UpsertCodexSessionFileInput {
+  filePath: string;
+  sessionId?: string | null;
+  sizeBytes: number;
+  mtimeMs: number;
+  parsedOffset: number;
+  pendingTail?: string;
+  missing: boolean;
+  importVersion: number;
+  lastSeenAt?: string;
+}
+
+export interface UpsertCodexLimitHeadInput {
+  accountFingerprint: string;
+  projectRoot?: string | null;
+  limitId: string;
+  model?: string | null;
+  source?: string;
+  snapshot: RuntimeLimitSnapshot;
+  observedAt: string;
+  sessionId?: string | null;
+  filePath?: string | null;
+}
+
+export interface AppendCodexLimitHistoryInput {
+  accountFingerprint: string;
+  projectRoot?: string | null;
+  limitId: string;
+  model?: string | null;
+  snapshot: RuntimeLimitSnapshot;
+  observedAt: string;
+  sessionId?: string | null;
+  filePath?: string | null;
+  headKey?: string;
+}
+
+export interface CodexIndexCursorValue {
+  cursorKey: string;
+  cursorValue: string | null;
+  cursorJson: Record<string, unknown> | null;
+  updatedAt: string;
+}
+
+export interface ListCodexLimitHeadsForOverlayInput {
+  accountFingerprint: string;
+  projectRoot: string | null;
+  includeGlobalFallback?: boolean;
+  limitId?: string | null;
+  model?: string | null;
+  limit?: number;
+}
+
+export interface CodexLimitHeadWithSnapshot {
+  headKey: string;
+  accountFingerprint: string;
+  projectRoot: string | null;
+  limitId: string;
+  model: string | null;
+  source: string;
+  snapshot: RuntimeLimitSnapshot | null;
+  observedAt: string;
+  sessionId: string | null;
+  filePath: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CodexLimitHeadScopeRow {
+  headKey: string;
+  projectRoot: string | null;
+  observedAt: string;
+  filePath: string | null;
+}
+
+export interface PruneCodexLimitRowsBeforeObservedAtResult {
+  deletedScopes: CodexLimitHeadScopeRow[];
+  headRowsDeleted: number;
+  historyRowsDeleted: number;
+}
+
+export interface PruneStaleCodexSessionIndexRowsResult {
+  sessionRowsDeleted: number;
+  fileRowsDeleted: number;
+  linkedRowsRetained: number;
+}
+
+function normalizeCodexProjectRoot(projectRoot: string | null | undefined): string | null {
+  if (typeof projectRoot !== "string") return null;
+  const trimmed = projectRoot.trim();
+  if (trimmed.length === 0) return null;
+  const normalized = trimmed
+    .replace(/[\\/]+/g, "/")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function sanitizeCodexCount(value: number | undefined, fallback = 0): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return Math.max(0, Math.trunc(value));
+}
+
+function parseCodexCursorJson(
+  raw: string | null | undefined,
+  cursorKey: string,
+): Record<string, unknown> | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isObjectRecord(parsed)) {
+      log.warn({ cursorKey }, "Malformed codex index cursor JSON payload");
+      return null;
+    }
+    return parsed;
+  } catch (error) {
+    log.warn(
+      {
+        cursorKey,
+        error: error instanceof Error ? error.message : String(error),
+      },
+      "Failed to parse codex index cursor JSON payload",
+    );
+    return null;
+  }
+}
+
+function mapCodexLimitHeadWithSnapshot(row: CodexLimitHeadIndexRow): CodexLimitHeadWithSnapshot {
+  return {
+    headKey: row.headKey,
+    accountFingerprint: row.accountFingerprint,
+    projectRoot: row.projectRoot,
+    limitId: row.limitId,
+    model: row.model,
+    source: row.source,
+    snapshot: parseRuntimeLimitSnapshot(row.snapshotJson, "codex_limit_head", row.headKey),
+    observedAt: row.observedAt,
+    sessionId: row.sessionId,
+    filePath: row.filePath,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+export function buildCodexLimitHeadKey(input: {
+  accountFingerprint: string;
+  projectRoot?: string | null;
+  limitId: string;
+  model?: string | null;
+}): string {
+  return JSON.stringify([
+    input.accountFingerprint,
+    normalizeCodexProjectRoot(input.projectRoot) ?? "",
+    input.limitId,
+    input.model ?? "",
+  ]);
+}
+
+// SQLite default SQLITE_MAX_VARIABLE_NUMBER is 999. Each row binds N columns,
+// so bulk writes must chunk to stay under the limit. Without chunking the
+// indexer warm-up crashes with "too many SQL variables" on any real
+// ~/.codex/sessions (thousands of rollouts).
+const CODEX_SESSION_UPSERT_BATCH = 50; // 14 cols × 50 = 700
+const CODEX_SESSION_FILE_UPSERT_BATCH = 70; // 11 cols × 70 = 770
+const CODEX_LIMIT_HEAD_UPSERT_BATCH = 70; // 12 cols × 70 = 840
+const CODEX_LIMIT_HISTORY_INSERT_BATCH = 90; // 10 cols × 90 = 900
+const CODEX_FILEPATH_IN_ARRAY_BATCH = 500; // single-column inArray
+
+export function upsertCodexSessions(rows: UpsertCodexSessionInput[]): number {
+  if (rows.length === 0) {
+    log.debug({ requestedCount: 0 }, "Skipping codex session upsert (empty batch)");
+    return 0;
+  }
+
+  const nowIso = new Date().toISOString();
+  const values = rows.map((row) => ({
+    sessionId: row.sessionId,
+    filePath: row.filePath,
+    title: row.title ?? null,
+    projectRoot: normalizeCodexProjectRoot(row.projectRoot),
+    accountFingerprint: row.accountFingerprint ?? null,
+    sourceCreatedAt: row.sourceCreatedAt ?? null,
+    sourceUpdatedAt: row.sourceUpdatedAt ?? null,
+    messageCount: sanitizeCodexCount(row.messageCount, 0),
+    previewText: row.previewText ?? null,
+    sizeBytes: sanitizeCodexCount(row.sizeBytes, 0),
+    mtimeMs: sanitizeCodexCount(row.mtimeMs, 0),
+    lastIndexedAt: row.lastIndexedAt ?? nowIso,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  }));
+
+  let totalChanges = 0;
+  for (let i = 0; i < values.length; i += CODEX_SESSION_UPSERT_BATCH) {
+    const chunk = values.slice(i, i + CODEX_SESSION_UPSERT_BATCH);
+    const result = getDb()
+      .insert(codexSessions)
+      .values(chunk)
+      .onConflictDoUpdate({
+        target: codexSessions.sessionId,
+        set: {
+          filePath: sql`excluded.file_path`,
+          title: sql`excluded.title`,
+          projectRoot: sql`excluded.project_root`,
+          accountFingerprint: sql`excluded.account_fingerprint`,
+          sourceCreatedAt: sql`excluded.source_created_at`,
+          sourceUpdatedAt: sql`excluded.source_updated_at`,
+          messageCount: sql`excluded.message_count`,
+          previewText: sql`excluded.preview_text`,
+          sizeBytes: sql`excluded.size_bytes`,
+          mtimeMs: sql`excluded.mtime_ms`,
+          lastIndexedAt: sql`excluded.last_indexed_at`,
+          updatedAt: sql`excluded.updated_at`,
+        },
+      })
+      .run();
+    totalChanges += result.changes;
+  }
+
+  log.debug(
+    { requestedCount: rows.length, changedRows: totalChanges },
+    "Upserted codex session index batch",
+  );
+  return totalChanges;
+}
+
+export function upsertCodexSessionFiles(rows: UpsertCodexSessionFileInput[]): number {
+  if (rows.length === 0) {
+    log.debug({ requestedCount: 0 }, "Skipping codex session-file upsert (empty batch)");
+    return 0;
+  }
+
+  const nowIso = new Date().toISOString();
+  const values = rows.map((row) => ({
+    filePath: row.filePath,
+    sessionId: row.sessionId ?? null,
+    sizeBytes: sanitizeCodexCount(row.sizeBytes, 0),
+    mtimeMs: sanitizeCodexCount(row.mtimeMs, 0),
+    parsedOffset: sanitizeCodexCount(row.parsedOffset, 0),
+    pendingTail: row.pendingTail ?? "",
+    missing: row.missing,
+    importVersion: sanitizeCodexCount(row.importVersion, 1),
+    lastSeenAt: row.lastSeenAt ?? nowIso,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  }));
+
+  let totalChanges = 0;
+  for (let i = 0; i < values.length; i += CODEX_SESSION_FILE_UPSERT_BATCH) {
+    const chunk = values.slice(i, i + CODEX_SESSION_FILE_UPSERT_BATCH);
+    const result = getDb()
+      .insert(codexSessionFiles)
+      .values(chunk)
+      .onConflictDoUpdate({
+        target: codexSessionFiles.filePath,
+        set: {
+          sessionId: sql`excluded.session_id`,
+          sizeBytes: sql`excluded.size_bytes`,
+          mtimeMs: sql`excluded.mtime_ms`,
+          parsedOffset: sql`excluded.parsed_offset`,
+          pendingTail: sql`excluded.pending_tail`,
+          missing: sql`excluded.missing`,
+          importVersion: sql`excluded.import_version`,
+          lastSeenAt: sql`excluded.last_seen_at`,
+          updatedAt: sql`excluded.updated_at`,
+        },
+      })
+      .run();
+    totalChanges += result.changes;
+  }
+
+  log.debug(
+    { requestedCount: rows.length, changedRows: totalChanges },
+    "Upserted codex session-file index batch",
+  );
+  return totalChanges;
+}
+
+export function listCodexSessionFileStates(): CodexSessionFileIndexRow[] {
+  const rows = getDb()
+    .select()
+    .from(codexSessionFiles)
+    .orderBy(desc(codexSessionFiles.updatedAt))
+    .all();
+  log.debug({ returnedCount: rows.length }, "Listed codex session-file index state rows");
+  return rows;
+}
+
+export function listCodexSessionFileStatesByPaths(filePaths: string[]): CodexSessionFileIndexRow[] {
+  if (filePaths.length === 0) {
+    return [];
+  }
+
+  const all: CodexSessionFileIndexRow[] = [];
+  for (let i = 0; i < filePaths.length; i += CODEX_FILEPATH_IN_ARRAY_BATCH) {
+    const chunk = filePaths.slice(i, i + CODEX_FILEPATH_IN_ARRAY_BATCH);
+    const rows = getDb()
+      .select()
+      .from(codexSessionFiles)
+      .where(inArray(codexSessionFiles.filePath, chunk))
+      .all();
+    all.push(...rows);
+  }
+  log.debug(
+    { requestedCount: filePaths.length, returnedCount: all.length },
+    "Listed codex session-file index rows by file path",
+  );
+  return all;
+}
+
+export function deleteCodexSessionsByFilePaths(filePaths: string[]): number {
+  if (filePaths.length === 0) {
+    return 0;
+  }
+  let totalChanges = 0;
+  for (let i = 0; i < filePaths.length; i += CODEX_FILEPATH_IN_ARRAY_BATCH) {
+    const chunk = filePaths.slice(i, i + CODEX_FILEPATH_IN_ARRAY_BATCH);
+    const result = getDb()
+      .delete(codexSessions)
+      .where(inArray(codexSessions.filePath, chunk))
+      .run();
+    totalChanges += result.changes;
+  }
+  log.debug(
+    { requestedCount: filePaths.length, deletedRows: totalChanges },
+    "Deleted codex indexed sessions by file paths",
+  );
+  return totalChanges;
+}
+
+export function deleteCodexSessionFilesByFilePaths(filePaths: string[]): number {
+  if (filePaths.length === 0) {
+    return 0;
+  }
+  let totalChanges = 0;
+  for (let i = 0; i < filePaths.length; i += CODEX_FILEPATH_IN_ARRAY_BATCH) {
+    const chunk = filePaths.slice(i, i + CODEX_FILEPATH_IN_ARRAY_BATCH);
+    const result = getDb()
+      .delete(codexSessionFiles)
+      .where(inArray(codexSessionFiles.filePath, chunk))
+      .run();
+    totalChanges += result.changes;
+  }
+  log.debug(
+    { requestedCount: filePaths.length, deletedRows: totalChanges },
+    "Deleted codex session-file rows by file paths",
+  );
+  return totalChanges;
+}
+
+export function pruneStaleCodexSessionIndexRows(input: {
+  mtimeBeforeMs: number;
+}): PruneStaleCodexSessionIndexRowsResult {
+  if (!Number.isFinite(input.mtimeBeforeMs)) {
+    return { sessionRowsDeleted: 0, fileRowsDeleted: 0, linkedRowsRetained: 0 };
+  }
+
+  const mtimeBeforeMs = Math.max(0, Math.trunc(input.mtimeBeforeMs));
+  const staleLinkedSessionRows = getDb()
+    .select({ filePath: codexSessions.filePath, sessionId: codexSessions.sessionId })
+    .from(codexSessions)
+    .where(
+      and(
+        lt(codexSessions.mtimeMs, mtimeBeforeMs),
+        sql`EXISTS (
+          SELECT 1 FROM ${chatSessions}
+          WHERE ${chatSessions.runtimeSessionId} = ${codexSessions.sessionId}
+             OR ${chatSessions.agentSessionId} = ${codexSessions.sessionId}
+        )`,
+      ),
+    )
+    .all();
+  const staleLinkedFileRows = getDb()
+    .select({ filePath: codexSessionFiles.filePath, sessionId: codexSessionFiles.sessionId })
+    .from(codexSessionFiles)
+    .where(
+      and(
+        lt(codexSessionFiles.mtimeMs, mtimeBeforeMs),
+        sql`EXISTS (
+          SELECT 1 FROM ${chatSessions}
+          WHERE ${chatSessions.runtimeSessionId} = ${codexSessionFiles.sessionId}
+             OR ${chatSessions.agentSessionId} = ${codexSessionFiles.sessionId}
+        )`,
+      ),
+    )
+    .all();
+
+  const linkedPaths = new Set<string>();
+  const retainedLinkedSessionIds = new Set<string>();
+  for (const row of [...staleLinkedSessionRows, ...staleLinkedFileRows]) {
+    linkedPaths.add(row.filePath);
+    if (row.sessionId) {
+      retainedLinkedSessionIds.add(row.sessionId);
+    }
+  }
+
+  const staleSessionRows = getDb()
+    .select({ filePath: codexSessions.filePath, sessionId: codexSessions.sessionId })
+    .from(codexSessions)
+    .where(
+      and(
+        lt(codexSessions.mtimeMs, mtimeBeforeMs),
+        sql`NOT EXISTS (
+          SELECT 1 FROM ${chatSessions}
+          WHERE ${chatSessions.runtimeSessionId} = ${codexSessions.sessionId}
+             OR ${chatSessions.agentSessionId} = ${codexSessions.sessionId}
+        )`,
+      ),
+    )
+    .all();
+  const staleFileRows = getDb()
+    .select({ filePath: codexSessionFiles.filePath, sessionId: codexSessionFiles.sessionId })
+    .from(codexSessionFiles)
+    .where(
+      and(
+        lt(codexSessionFiles.mtimeMs, mtimeBeforeMs),
+        sql`NOT EXISTS (
+          SELECT 1 FROM ${chatSessions}
+          WHERE ${chatSessions.runtimeSessionId} = ${codexSessionFiles.sessionId}
+             OR ${chatSessions.agentSessionId} = ${codexSessionFiles.sessionId}
+        )`,
+      ),
+    )
+    .all();
+
+  const candidatePaths = new Set<string>();
+  for (const row of [...staleSessionRows, ...staleFileRows]) {
+    candidatePaths.add(row.filePath);
+  }
+  const filePaths = [...candidatePaths].filter((filePath) => !linkedPaths.has(filePath));
+  const sessionRowsDeleted = deleteCodexSessionsByFilePaths(filePaths);
+  const fileRowsDeleted = deleteCodexSessionFilesByFilePaths(filePaths);
+  log.debug(
+    {
+      mtimeBeforeMs,
+      candidateSessionRows: staleSessionRows.length,
+      candidateFileRows: staleFileRows.length,
+      deletedPathCount: filePaths.length,
+      sessionRowsDeleted,
+      fileRowsDeleted,
+      linkedRowsRetained: retainedLinkedSessionIds.size,
+    },
+    "Pruned stale codex session index rows",
+  );
+  return {
+    sessionRowsDeleted,
+    fileRowsDeleted,
+    linkedRowsRetained: retainedLinkedSessionIds.size,
+  };
+}
+
+export function listCodexLimitHeadScopesByFilePaths(
+  filePaths: string[],
+): CodexLimitHeadScopeRow[] {
+  if (filePaths.length === 0) {
+    return [];
+  }
+  const all: CodexLimitHeadScopeRow[] = [];
+  for (let i = 0; i < filePaths.length; i += CODEX_FILEPATH_IN_ARRAY_BATCH) {
+    const chunk = filePaths.slice(i, i + CODEX_FILEPATH_IN_ARRAY_BATCH);
+    const rows = getDb()
+      .select({
+        headKey: codexLimitHeads.headKey,
+        projectRoot: codexLimitHeads.projectRoot,
+        observedAt: codexLimitHeads.observedAt,
+        filePath: codexLimitHeads.filePath,
+      })
+      .from(codexLimitHeads)
+      .where(inArray(codexLimitHeads.filePath, chunk))
+      .all();
+    all.push(...rows);
+  }
+  log.debug(
+    { requestedCount: filePaths.length, returnedCount: all.length },
+    "Listed codex limit-head scopes by file paths",
+  );
+  return all;
+}
+
+export function deleteCodexLimitHeadsByFilePaths(filePaths: string[]): number {
+  if (filePaths.length === 0) {
+    return 0;
+  }
+  let totalChanges = 0;
+  for (let i = 0; i < filePaths.length; i += CODEX_FILEPATH_IN_ARRAY_BATCH) {
+    const chunk = filePaths.slice(i, i + CODEX_FILEPATH_IN_ARRAY_BATCH);
+    const result = getDb()
+      .delete(codexLimitHeads)
+      .where(inArray(codexLimitHeads.filePath, chunk))
+      .run();
+    totalChanges += result.changes;
+  }
+  log.debug(
+    { requestedCount: filePaths.length, deletedRows: totalChanges },
+    "Deleted codex limit-head rows by file paths",
+  );
+  return totalChanges;
+}
+
+export function deleteCodexLimitHistoryByFilePaths(filePaths: string[]): number {
+  if (filePaths.length === 0) {
+    return 0;
+  }
+  let totalChanges = 0;
+  for (let i = 0; i < filePaths.length; i += CODEX_FILEPATH_IN_ARRAY_BATCH) {
+    const chunk = filePaths.slice(i, i + CODEX_FILEPATH_IN_ARRAY_BATCH);
+    const result = getDb()
+      .delete(codexLimitHistory)
+      .where(inArray(codexLimitHistory.filePath, chunk))
+      .run();
+    totalChanges += result.changes;
+  }
+  log.debug(
+    { requestedCount: filePaths.length, deletedRows: totalChanges },
+    "Deleted codex limit-history rows by file paths",
+  );
+  return totalChanges;
+}
+
+export function pruneCodexLimitRowsBeforeObservedAt(
+  observedBefore: string,
+): PruneCodexLimitRowsBeforeObservedAtResult {
+  const trimmedObservedBefore = observedBefore.trim();
+  if (trimmedObservedBefore.length === 0) {
+    return { deletedScopes: [], headRowsDeleted: 0, historyRowsDeleted: 0 };
+  }
+
+  const result = getDb().transaction((tx) => {
+    const deletedScopes = tx
+      .select({
+        headKey: codexLimitHeads.headKey,
+        projectRoot: codexLimitHeads.projectRoot,
+        observedAt: codexLimitHeads.observedAt,
+        filePath: codexLimitHeads.filePath,
+      })
+      .from(codexLimitHeads)
+      .where(lt(codexLimitHeads.observedAt, trimmedObservedBefore))
+      .all();
+    const headRowsDeleted = tx
+      .delete(codexLimitHeads)
+      .where(lt(codexLimitHeads.observedAt, trimmedObservedBefore))
+      .run().changes;
+    const historyRowsDeleted = tx
+      .delete(codexLimitHistory)
+      .where(lt(codexLimitHistory.observedAt, trimmedObservedBefore))
+      .run().changes;
+    return { deletedScopes, headRowsDeleted, historyRowsDeleted };
+  });
+
+  log.debug(
+    {
+      observedBefore: trimmedObservedBefore,
+      deletedScopeCount: result.deletedScopes.length,
+      headRowsDeleted: result.headRowsDeleted,
+      historyRowsDeleted: result.historyRowsDeleted,
+    },
+    "Pruned stale codex limit rows by observed time",
+  );
+  return result;
+}
+
+export function upsertCodexLimitHeads(rows: UpsertCodexLimitHeadInput[]): number {
+  if (rows.length === 0) {
+    log.debug({ requestedCount: 0 }, "Skipping codex limit-head upsert (empty batch)");
+    return 0;
+  }
+
+  const nowIso = new Date().toISOString();
+  const values = rows.map((row) => ({
+    headKey: buildCodexLimitHeadKey(row),
+    accountFingerprint: row.accountFingerprint,
+    projectRoot: normalizeCodexProjectRoot(row.projectRoot),
+    limitId: row.limitId,
+    model: row.model ?? null,
+    source: row.source ?? "codex",
+    snapshotJson: JSON.stringify(row.snapshot),
+    observedAt: row.observedAt,
+    sessionId: row.sessionId ?? null,
+    filePath: row.filePath ?? null,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  }));
+
+  let totalChanges = 0;
+  for (let i = 0; i < values.length; i += CODEX_LIMIT_HEAD_UPSERT_BATCH) {
+    const chunk = values.slice(i, i + CODEX_LIMIT_HEAD_UPSERT_BATCH);
+    const result = getDb()
+      .insert(codexLimitHeads)
+      .values(chunk)
+      .onConflictDoUpdate({
+        target: codexLimitHeads.headKey,
+        set: {
+          accountFingerprint: sql`excluded.account_fingerprint`,
+          projectRoot: sql`excluded.project_root`,
+          limitId: sql`excluded.limit_id`,
+          model: sql`excluded.model`,
+          source: sql`excluded.source`,
+          snapshotJson: sql`excluded.snapshot_json`,
+          observedAt: sql`excluded.observed_at`,
+          sessionId: sql`excluded.session_id`,
+          filePath: sql`excluded.file_path`,
+          updatedAt: sql`excluded.updated_at`,
+        },
+      })
+      .run();
+    totalChanges += result.changes;
+  }
+
+  log.debug(
+    { requestedCount: rows.length, changedRows: totalChanges },
+    "Upserted codex limit-head index batch",
+  );
+  return totalChanges;
+}
+
+export function appendCodexLimitHistory(rows: AppendCodexLimitHistoryInput[]): number {
+  if (rows.length === 0) {
+    log.debug({ requestedCount: 0 }, "Skipping codex limit-history append (empty batch)");
+    return 0;
+  }
+
+  const nowIso = new Date().toISOString();
+  const values = rows.map((row) => ({
+    headKey: row.headKey ?? buildCodexLimitHeadKey(row),
+    accountFingerprint: row.accountFingerprint,
+    projectRoot: normalizeCodexProjectRoot(row.projectRoot),
+    limitId: row.limitId,
+    model: row.model ?? null,
+    snapshotJson: JSON.stringify(row.snapshot),
+    observedAt: row.observedAt,
+    sessionId: row.sessionId ?? null,
+    filePath: row.filePath ?? null,
+    createdAt: nowIso,
+  }));
+
+  let totalChanges = 0;
+  for (let i = 0; i < values.length; i += CODEX_LIMIT_HISTORY_INSERT_BATCH) {
+    const chunk = values.slice(i, i + CODEX_LIMIT_HISTORY_INSERT_BATCH);
+    const result = getDb().insert(codexLimitHistory).values(chunk).run();
+    totalChanges += result.changes;
+  }
+  log.debug(
+    { requestedCount: rows.length, changedRows: totalChanges },
+    "Appended codex limit-history rows",
+  );
+  return totalChanges;
+}
+
+export function pruneCodexLimitHistoryByHead(input: {
+  headKey: string;
+  keepLatest: number;
+}): number {
+  const keepLatest = sanitizeCodexCount(input.keepLatest, 0);
+  const ids = getDb()
+    .select({ id: codexLimitHistory.id })
+    .from(codexLimitHistory)
+    .where(eq(codexLimitHistory.headKey, input.headKey))
+    .orderBy(desc(codexLimitHistory.observedAt), desc(codexLimitHistory.id))
+    .all();
+
+  const staleIds = ids.slice(keepLatest).map((row) => row.id);
+  if (staleIds.length === 0) {
+    log.debug(
+      { candidateRows: ids.length, keepLatest, deletedRows: 0 },
+      "Pruned codex limit-history rows",
+    );
+    return 0;
+  }
+
+  let deleted = 0;
+  for (let i = 0; i < staleIds.length; i += CODEX_FILEPATH_IN_ARRAY_BATCH) {
+    const chunk = staleIds.slice(i, i + CODEX_FILEPATH_IN_ARRAY_BATCH);
+    const result = getDb()
+      .delete(codexLimitHistory)
+      .where(inArray(codexLimitHistory.id, chunk))
+      .run();
+    deleted += result.changes;
+  }
+  log.debug(
+    {
+      candidateRows: ids.length,
+      keepLatest,
+      deletedRows: deleted,
+    },
+    "Pruned codex limit-history rows",
+  );
+  return deleted;
+}
+
+export function pruneCodexLimitHistoryRetention(maxRowsPerHead: number): number {
+  const keepLatest = sanitizeCodexCount(maxRowsPerHead, 0);
+  const headRows = getDb()
+    .select({ headKey: codexLimitHistory.headKey })
+    .from(codexLimitHistory)
+    .groupBy(codexLimitHistory.headKey)
+    .all();
+
+  let deletedRows = 0;
+  for (const row of headRows) {
+    deletedRows += pruneCodexLimitHistoryByHead({ headKey: row.headKey, keepLatest });
+  }
+
+  log.debug(
+    { headCount: headRows.length, keepLatest, deletedRows },
+    "Completed codex limit-history retention cleanup",
+  );
+  return deletedRows;
+}
+
+export function upsertCodexIndexCursor(input: {
+  cursorKey: string;
+  cursorValue?: string | null;
+  cursorJson?: Record<string, unknown> | null;
+  updatedAt?: string;
+}): CodexIndexCursorValue | undefined {
+  const updatedAt = input.updatedAt ?? new Date().toISOString();
+  const cursorJson = input.cursorJson == null ? null : JSON.stringify(input.cursorJson);
+  getDb()
+    .insert(codexIndexCursors)
+    .values({
+      cursorKey: input.cursorKey,
+      cursorValue: input.cursorValue ?? null,
+      cursorJson,
+      updatedAt,
+    })
+    .onConflictDoUpdate({
+      target: codexIndexCursors.cursorKey,
+      set: {
+        cursorValue: sql`excluded.cursor_value`,
+        cursorJson: sql`excluded.cursor_json`,
+        updatedAt: sql`excluded.updated_at`,
+      },
+    })
+    .run();
+
+  log.debug({ cursorKey: input.cursorKey }, "Upserted codex index cursor");
+  return findCodexIndexCursor(input.cursorKey);
+}
+
+export function findCodexIndexCursor(cursorKey: string): CodexIndexCursorValue | undefined {
+  const row = getDb()
+    .select()
+    .from(codexIndexCursors)
+    .where(eq(codexIndexCursors.cursorKey, cursorKey))
+    .get();
+  if (!row) return undefined;
+
+  return {
+    cursorKey: row.cursorKey,
+    cursorValue: row.cursorValue,
+    cursorJson: parseCodexCursorJson(row.cursorJson, row.cursorKey),
+    updatedAt: row.updatedAt,
+  };
+}
+
+export function listCodexSessionsByProjectRoot(input: {
+  projectRoot: string | null;
+  limit?: number;
+}): CodexSessionIndexRow[] {
+  const limit = sanitizeCodexCount(input.limit, 20);
+  const projectRoot = normalizeCodexProjectRoot(input.projectRoot);
+  const whereClause =
+    projectRoot == null ? isNull(codexSessions.projectRoot) : eq(codexSessions.projectRoot, projectRoot);
+
+  const rows = getDb()
+    .select()
+    .from(codexSessions)
+    .where(whereClause)
+    .orderBy(desc(codexSessions.sourceUpdatedAt), desc(codexSessions.mtimeMs), desc(codexSessions.updatedAt))
+    .limit(limit)
+    .all();
+
+  log.debug(
+    { scope: projectRoot == null ? "global" : "project", requestedLimit: limit, returnedCount: rows.length },
+    "Listed codex indexed sessions for project scope",
+  );
+  return rows;
+}
+
+export function findCodexSessionFilePathBySessionId(sessionId: string): string | null {
+  const sessionRow = getDb()
+    .select({ filePath: codexSessions.filePath })
+    .from(codexSessions)
+    .where(eq(codexSessions.sessionId, sessionId))
+    .get();
+  if (sessionRow?.filePath) {
+    log.debug({ sessionId, source: "codex_sessions", hit: true }, "Resolved codex session file path");
+    return sessionRow.filePath;
+  }
+
+  const fileRow = getDb()
+    .select({ filePath: codexSessionFiles.filePath })
+    .from(codexSessionFiles)
+    .where(eq(codexSessionFiles.sessionId, sessionId))
+    .orderBy(desc(codexSessionFiles.updatedAt))
+    .get();
+
+  const filePath = fileRow?.filePath ?? null;
+  log.debug(
+    { sessionId, source: "codex_session_files", hit: filePath != null },
+    "Resolved codex session file path",
+  );
+  return filePath;
+}
+
+export function listCodexLimitHeadsForOverlay(
+  input: ListCodexLimitHeadsForOverlayInput,
+): CodexLimitHeadWithSnapshot[] {
+  const projectRoot = normalizeCodexProjectRoot(input.projectRoot);
+  const includeGlobalFallback = input.includeGlobalFallback ?? true;
+  const limit = sanitizeCodexCount(input.limit, 20);
+  const predicates = [eq(codexLimitHeads.accountFingerprint, input.accountFingerprint)];
+
+  if (input.limitId != null) {
+    predicates.push(eq(codexLimitHeads.limitId, input.limitId));
+  }
+  if (input.model != null) {
+    predicates.push(eq(codexLimitHeads.model, input.model));
+  }
+
+  if (projectRoot == null) {
+    predicates.push(isNull(codexLimitHeads.projectRoot));
+  } else if (includeGlobalFallback) {
+    predicates.push(
+      or(eq(codexLimitHeads.projectRoot, projectRoot), isNull(codexLimitHeads.projectRoot))!,
+    );
+  } else {
+    predicates.push(eq(codexLimitHeads.projectRoot, projectRoot));
+  }
+
+  const whereClause = and(...predicates);
+  const scopeOrder =
+    projectRoot == null
+      ? [desc(codexLimitHeads.observedAt), desc(codexLimitHeads.updatedAt)]
+      : [
+          desc(
+            sql<number>`case when ${codexLimitHeads.projectRoot} = ${projectRoot} then 1 else 0 end`,
+          ),
+          desc(codexLimitHeads.observedAt),
+          desc(codexLimitHeads.updatedAt),
+        ];
+
+  const rows = getDb()
+    .select()
+    .from(codexLimitHeads)
+    .where(whereClause)
+    .orderBy(...scopeOrder)
+    .limit(limit)
+    .all();
+
+  const mapped = rows.map(mapCodexLimitHeadWithSnapshot);
+  log.debug(
+    {
+      scope: projectRoot == null ? "global" : "project",
+      includeGlobalFallback,
+      requestedLimit: limit,
+      returnedCount: mapped.length,
+    },
+    "Listed codex limit-head overlay rows",
+  );
+  return mapped;
+}
+
+export function findPreferredCodexLimitHeadForOverlay(
+  input: ListCodexLimitHeadsForOverlayInput,
+): CodexLimitHeadWithSnapshot | null {
+  const rows = listCodexLimitHeadsForOverlay({ ...input, limit: input.limit ?? 20 });
+  for (const row of rows) {
+    if (row.snapshot) {
+      log.debug(
+        {
+          scope: row.projectRoot == null ? "global" : "project",
+          limitId: row.limitId,
+        },
+        "Resolved preferred codex limit-head overlay row",
+      );
+      return row;
+    }
+  }
+  log.debug(
+    {
+      scope: normalizeCodexProjectRoot(input.projectRoot) == null ? "global" : "project",
+      limitId: input.limitId ?? null,
+      model: input.model ?? null,
+    },
+    "No codex limit-head overlay row available",
+  );
+  return null;
 }

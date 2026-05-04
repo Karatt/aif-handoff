@@ -11,6 +11,12 @@ vi.mock("@/hooks/useRuntimeProfiles", () => ({
   useRuntimeModels: () => mockRuntimeModels,
 }));
 
+// CodexLoginCard depends on React Query; the form tests don't provide a
+// QueryClient, so we stub the card to an empty render.
+vi.mock("@/components/settings/CodexLoginCard", () => ({
+  CodexLoginCard: () => null,
+}));
+
 const { RuntimeProfileForm } = await import("@/components/settings/RuntimeProfileForm");
 
 function createRuntimeDescriptor(overrides: Partial<RuntimeDescriptor>): RuntimeDescriptor {
@@ -24,6 +30,7 @@ function createRuntimeDescriptor(overrides: Partial<RuntimeDescriptor>): Runtime
     supportedTransports: ["sdk"],
     capabilities: {
       supportsResume: true,
+      supportsSessionFork: false,
       supportsSessionList: false,
       supportsAgentDefinitions: false,
       supportsStreaming: true,
@@ -44,6 +51,13 @@ function createDeferredResult() {
   return { promise, resolve };
 }
 
+async function flushModelDiscoveryDebounce() {
+  await act(async () => {
+    vi.advanceTimersByTime(350);
+    await Promise.resolve();
+  });
+}
+
 describe("RuntimeProfileForm", () => {
   beforeEach(() => {
     mockRuntimeModels.isPending = false;
@@ -59,6 +73,7 @@ describe("RuntimeProfileForm", () => {
   });
 
   it("uses runtime default transport, keeps manual model input, and stores codex effort separately", async () => {
+    vi.useFakeTimers();
     mockRuntimeModels.mutateAsync.mockResolvedValue({
       models: [
         {
@@ -94,18 +109,19 @@ describe("RuntimeProfileForm", () => {
 
     expect(screen.getByText("Leave empty to auto-fill from selected runtime")).toBeInTheDocument();
 
-    await waitFor(() => {
-      expect(mockRuntimeModels.mutateAsync).toHaveBeenCalledWith(
-        expect.objectContaining({
-          projectId: "project-1",
-          profile: expect.objectContaining({
-            runtimeId: "codex",
-            transport: "cli",
-          }),
-          forceRefresh: false,
+    await flushModelDiscoveryDebounce();
+    expect(mockRuntimeModels.mutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectId: "project-1",
+        profile: expect.objectContaining({
+          runtimeId: "codex",
+          transport: "cli",
         }),
-      );
-    });
+        forceRefresh: false,
+      }),
+    );
+    expect(screen.getByDisplayValue("gpt-5.4")).toBeInTheDocument();
+    vi.useRealTimers();
 
     fireEvent.change(screen.getByDisplayValue("gpt-5.4"), {
       target: { value: "gpt-5.4-custom" },
@@ -115,7 +131,7 @@ describe("RuntimeProfileForm", () => {
     fireEvent.click(screen.getByRole("button", { name: "XHIGH" }));
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
 
-    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit).toHaveBeenCalledWith(
       expect.objectContaining({
         name: "Codex",
@@ -126,6 +142,55 @@ describe("RuntimeProfileForm", () => {
         options: {
           modelReasoningEffort: "xhigh",
         },
+      }),
+    );
+  });
+
+  it("allows selecting codex app-server transport from runtime-supported transport options", async () => {
+    mockRuntimeModels.mutateAsync.mockResolvedValue({
+      models: [
+        {
+          id: "gpt-5.4",
+          label: "GPT-5.4",
+          metadata: {
+            supportedEffortLevels: ["minimal", "low", "medium", "high", "xhigh"],
+          },
+        },
+      ],
+      profile: {},
+    });
+    const onSubmit = vi.fn();
+
+    render(
+      <RuntimeProfileForm
+        mode="create"
+        projectId="project-1"
+        runtimes={[
+          createRuntimeDescriptor({
+            id: "codex",
+            providerId: "openai",
+            displayName: "Codex",
+            defaultTransport: "cli",
+            defaultApiKeyEnvVar: "OPENAI_API_KEY",
+            defaultModelPlaceholder: "gpt-5.4",
+            supportedTransports: ["sdk", "cli", "app-server", "api"],
+          }),
+        ]}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByDisplayValue("gpt-5.4")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "CLI" }));
+    fireEvent.click(screen.getByRole("button", { name: "APP-SERVER" }));
+    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1));
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runtimeId: "codex",
+        transport: "app-server",
       }),
     );
   });
