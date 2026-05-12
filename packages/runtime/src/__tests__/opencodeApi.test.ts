@@ -34,6 +34,10 @@ function jsonResponse(payload: unknown, status = 200): Response {
 describe("OpenCode API transport", () => {
   const fetchMock = vi.fn();
 
+  function requestInitAt(index: number): RequestInit & { dispatcher?: unknown } {
+    return (fetchMock.mock.calls[index] ?? [])[1] as RequestInit & { dispatcher?: unknown };
+  }
+
   beforeEach(() => {
     fetchMock.mockReset();
     vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
@@ -76,6 +80,8 @@ describe("OpenCode API transport", () => {
     expect((fetchMock.mock.calls[1]?.[0] as string).endsWith("/session/session-1/message")).toBe(
       true,
     );
+    expect(requestInitAt(0).dispatcher).toBeUndefined();
+    expect(requestInitAt(1).dispatcher).toBeDefined();
 
     const postBody = JSON.parse(String((fetchMock.mock.calls[1]?.[1] as RequestInit).body)) as {
       model: { providerID: string; modelID: string };
